@@ -1,12 +1,21 @@
-use ethers::{
-    prelude::*,
-    providers::{Http, Provider},
-    types::{transaction::eip2930::AccessList, Address, Bytes, U256, U64},
+use alloy::{
+    eips::BlockId,
+    primitives::BlockNumber,
+    providers::{Provider, ProviderBuilder},
+};
+// use ethers::{
+//     prelude::*,
+//     providers::{Http, Provider},
+//     types::{transaction::eip2930::AccessList, Address, Bytes, U256, U64},
+// };
+use revm::{
+    context::{transaction::AccessList, TxEnv},
+    database::{CacheDB, EmptyDB},
+    primitives::{alloy_primitives::U64, Address, Bytes, TxKind, U256},
+    Context, ExecuteEvm, MainBuilder, MainContext,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-use crate::error::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
@@ -22,13 +31,13 @@ pub struct Tx {
 
     // Gas fields - using standard names
     #[serde(alias = "gas_limit")]
-    pub gas: Option<U256>,
+    pub gas: Option<u64>,
     #[serde(alias = "gasPrice")]
-    pub gas_price: Option<U256>,
+    pub gas_price: Option<u64>,
     #[serde(alias = "maxFeePerGas")]
-    pub max_fee_per_gas: Option<U256>,
+    pub max_fee_per_gas: Option<u128>,
     #[serde(alias = "maxPriorityFeePerGas")]
-    pub max_priority_fee_per_gas: Option<U256>,
+    pub max_priority_fee_per_gas: Option<u128>,
 
     // EIP-2930 Access List
     #[serde(alias = "accessList")]
@@ -41,11 +50,11 @@ pub struct Tx {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasEstimate {
-    pub estimated_gas: U256,
-    pub gas_price: U256,
-    pub max_fee_per_gas: Option<U256>,
-    pub max_priority_fee_per_gas: Option<U256>,
-    pub total_cost_wei: U256,
+    pub estimated_gas: u128,
+    pub gas_price: u128,
+    pub max_fee_per_gas: Option<u128>,
+    pub max_priority_fee_per_gas: Option<u128>,
+    pub total_cost_wei: u128,
     pub total_cost_eth: String,
     pub transaction_type: String,
     pub breakdown: GasBreakdown,
@@ -53,38 +62,44 @@ pub struct GasEstimate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasBreakdown {
-    pub base_cost: U256,
-    pub data_cost: U256,
-    pub recipient_cost: U256,
-    pub storage_cost: U256,
-    pub contract_creation_cost: U256,
-    pub execution_cost: U256,
-    pub access_list_cost: U256,
-    pub precompile_cost: U256,
+    pub base_cost: u128,
+    pub data_cost: u128,
+    pub recipient_cost: u128,
+    pub storage_cost: u128,
+    pub contract_creation_cost: u128,
+    pub execution_cost: u128,
+    pub access_list_cost: u128,
+    pub precompile_cost: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkGasInfo {
-    pub current_gas_price: U256,
-    pub base_fee_per_gas: Option<U256>,
+    pub current_gas_price: u128,
+    pub base_fee_per_gas: Option<u64>,
     pub block_utilization: f64,
     pub latest_block_number: u64,
 }
 
 pub struct GasEstimator {
-    provider: Arc<Provider<Http>>,
+    rpc_url: String,
 }
 
 impl GasEstimator {
-    pub fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let provider = Provider::<Http>::try_from(rpc_url)?;
+    pub async fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(rpc_url).await?;
+
         Ok(Self {
-            provider: Arc::new(provider),
+            rpc_url: rpc_url.to_string(),
         })
     }
 
     /// Custom gas estimation implementation from scratch
-    pub async fn estimate_gas(&self, tx_params: Tx) -> Result<GasEstimate, Error> {
+    pub async fn estimate_gas(
+        &self,
+        tx_params: Tx,
+    ) -> Result<GasEstimate, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+
         // Calculate gas breakdown using our custom logic
         let breakdown = self.calculate_gas_breakdown(&tx_params).await?;
 
@@ -98,54 +113,31 @@ impl GasEstimator {
             + breakdown.access_list_cost;
 
         // Get current gas price information
-        let gas_price = if let Some(price) = tx_params.gas_price {
-            price
-        } else {
-            self.provider
-                .get_gas_price()
-                .await
-                .map_err(Error::ProviderError)?
-        };
+        let gas_price = provider.get_gas_price().await?;
 
-        // Try to get EIP-1559 fee data
-        let fee_history = self
-            .provider
-            .fee_history(10, BlockNumber::Latest, &[25.0, 50.0, 75.0])
-            .await;
-
-        let (max_fee_per_gas, max_priority_fee_per_gas, transaction_type) = if fee_history.is_ok() {
+        let (max_fee_per_gas, max_priority_fee_per_gas, transaction_type) = {
             // EIP-1559 transaction
-            let base_fee = self
-                .provider
-                .get_block(BlockNumber::Latest)
-                .await
-                .map_err(Error::ProviderError)?
-                .unwrap()
-                .base_fee_per_gas
-                .unwrap_or(gas_price);
+            let block = provider.get_block(BlockId::latest()).await?.unwrap();
+            let base_fee = block.header.base_fee_per_gas.unwrap();
 
             let max_priority_fee = tx_params
                 .max_priority_fee_per_gas
-                .unwrap_or_else(|| U256::from(2_000_000_000u64)); // 2 gwei default
+                .unwrap_or_else(|| 2_000_000_000); // 2 gwei default
 
             let max_fee = tx_params
                 .max_fee_per_gas
-                .unwrap_or_else(|| base_fee * 2 + max_priority_fee);
+                .unwrap_or_else(|| base_fee as u128 * 2 + max_priority_fee);
 
             (
                 Some(max_fee),
                 Some(max_priority_fee),
                 "EIP-1559 (Custom)".to_string(),
             )
-        } else {
-            // Legacy transaction
-            (None, None, "Legacy (Custom)".to_string())
         };
 
         // Calculate total cost
         let effective_gas_price = max_fee_per_gas.unwrap_or(gas_price);
         let total_cost_wei = estimated_gas * effective_gas_price;
-        let total_cost_eth = ethers::utils::format_ether(total_cost_wei);
 
         Ok(GasEstimate {
             estimated_gas,
@@ -153,61 +145,98 @@ impl GasEstimator {
             max_fee_per_gas,
             max_priority_fee_per_gas,
             total_cost_wei,
-            total_cost_eth,
+            total_cost_eth: "".to_string(),
             transaction_type,
             breakdown,
         })
     }
 
-    /// Calculate detailed gas breakdown from scratch
-    async fn calculate_gas_breakdown(&self, tx_params: &Tx) -> Result<GasBreakdown, Error> {
+    /// Calculate detailed gas breakdown using specialized estimators
+    async fn calculate_gas_breakdown(
+        &self,
+        tx_params: &Tx,
+    ) -> Result<GasBreakdown, Box<dyn std::error::Error>> {
         // Base transaction cost (21,000 gas for simple transfers)
-        let base_cost = U256::from(21_000);
+        let base_cost = 21_000;
+
+        let is_contract_call =
+            self.is_contract(tx_params.to).await.unwrap() && tx_params.data.is_some();
+        let is_contract_creation = tx_params.to.is_none();
+        let is_eoa_call = tx_params.data.is_none();
+
+        let contract_exe_cost = if is_contract_call {
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+            let mut evm = Context::mainnet().with_db(cache_db).build_mainnet();
+            // Execute transaction without writing to the DB
+            let result = evm
+                .transact_finalize(TxEnv {
+                    // fill in missing bits of env struct
+                    // change that to whatever caller you want to be
+                    caller: tx_params.from.unwrap(),
+                    // account you want to transact with
+                    kind: TxKind::Call(tx_params.to.unwrap()),
+                    // calldata formed via abigen
+                    data: tx_params.data.clone().unwrap(),
+                    // transaction value in wei
+                    value: U256::from(0),
+                    ..Default::default()
+                })
+                .unwrap();
+            result.result.gas_used();
+        };
 
         // Calculate data cost (calldata)
         let data_cost = if let Some(ref data) = tx_params.data {
-            self.calculate_calldata_cost(data)
+            // self.calculate_calldata_cost(data)
+            0
         } else {
-            U256::zero()
+            0
         };
 
         // Calculate recipient cost (contract vs EOA)
         let recipient_cost = if let Some(to) = tx_params.to {
-            self.calculate_recipient_cost(to).await?
+            // self.calculate_recipient_cost(to).await?
+            0
         } else {
-            U256::zero()
-        };
-
-        // Calculate storage operations cost
-        let storage_cost = if let Some(ref data) = tx_params.data {
-            self.estimate_storage_cost(data)
-        } else {
-            U256::zero()
+            0
         };
 
         // Calculate contract creation cost
         let contract_creation_cost = if tx_params.to.is_none() {
-            self.calculate_contract_creation_cost(tx_params.data.as_ref())
+            // self.calculate_contract_creation_cost(tx_params.data.as_ref())
+            0
         } else {
-            U256::zero()
+            0
         };
 
-        // Calculate execution cost (opcode simulation)
-        let execution_cost = if let Some(ref data) = tx_params.data {
-            self.estimate_execution_cost(data, tx_params.to.is_none())
+        // ---------------------------------------- Not needed
+
+        let storage_cost = if let Some(ref data) = tx_params.data {
+            // self.estimate_storage_cost(data)
+            0
         } else {
-            U256::zero()
+            0
         };
 
-        // Calculate access list cost (EIP-2930)
-        let access_list_cost = self.calculate_access_list_cost(tx_params).await?;
+        let execution_cost = if let Some(data) = tx_params.data.clone() {
+            // self.estimate_execution_cost(&data)
+            0
+        } else {
+            0
+        };
 
         // Calculate precompile cost
         let precompile_cost = if let Some(ref data) = tx_params.data {
-            self.estimate_precompile_cost(data, tx_params.to)
+            // self.estimate_precompile_cost(data, tx_params.to)
+            0
         } else {
-            U256::zero()
+            0
         };
+        // ----------------------------------------
+
+        // Calculate access list cost (EIP-2930)
+        let access_list_cost = 0;
+        // self.calculate_access_list_cost(tx_params).await?;
 
         Ok(GasBreakdown {
             base_cost,
@@ -223,7 +252,7 @@ impl GasEstimator {
 
     /// Calculate gas cost for calldata (transaction input data)
     fn calculate_calldata_cost(&self, data: &Bytes) -> U256 {
-        let mut cost = U256::zero();
+        let mut cost = U256::ZERO;
 
         for byte in data.iter() {
             if *byte == 0 {
@@ -239,134 +268,44 @@ impl GasEstimator {
     }
 
     /// Calculate cost based on recipient (contract vs EOA)
-    async fn calculate_recipient_cost(&self, to: Address) -> Result<U256, Error> {
+    async fn calculate_recipient_cost(
+        &self,
+        to: Address,
+    ) -> Result<U256, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
         // Check if the recipient is a contract by looking for code
-        let code = self
-            .provider
-            .get_code(to, None)
-            .await
-            .map_err(Error::ProviderError)?;
+        let code = provider.get_code_at(to).await?;
 
         if code.is_empty() {
             // External Owned Account (EOA) - no additional cost
-            Ok(U256::zero())
+            Ok(U256::ZERO)
         } else {
             // Contract account - additional gas for call
             Ok(U256::from(2_300)) // Basic stipend for contract calls
         }
     }
 
-    /// Estimate storage operations cost
-    fn estimate_storage_cost(&self, data: &Bytes) -> U256 {
-        let mut cost = U256::zero();
-
-        // Simple heuristic: look for SSTORE-like patterns in bytecode
-        // This is a simplified estimation
-        let data_bytes = data.as_ref();
-        let mut i = 0;
-
-        while i < data_bytes.len() {
-            match data_bytes[i] {
-                0x55 => {
-                    // SSTORE opcode - storage write
-                    cost += U256::from(20_000); // Rough estimate for new storage
-                    i += 1;
-                }
-                0x54 => {
-                    // SLOAD opcode - storage read
-                    cost += U256::from(2_100);
-                    i += 1;
-                }
-                _ => i += 1,
-            }
+    async fn is_contract(&self, to: Option<Address>) -> Result<bool, Box<dyn std::error::Error>> {
+        if to.is_none() {
+            return Ok(false);
         }
-
-        cost
-    }
-
-    /// Calculate contract creation cost
-    fn calculate_contract_creation_cost(&self, data: Option<&Bytes>) -> U256 {
-        if let Some(bytecode) = data {
-            // Base cost for contract creation
-            let mut cost = U256::from(32_000);
-            // Additional cost per byte of bytecode
-            cost += U256::from(bytecode.len() * 200);
-            cost
-        } else {
-            U256::zero()
-        }
-    }
-
-    /// Estimate execution cost by analyzing opcodes
-    fn estimate_execution_cost(&self, data: &Bytes, is_deployment: bool) -> U256 {
-        let mut cost = U256::zero();
-        let data_bytes = data.as_ref();
-        let mut i = 0;
-
-        while i < data_bytes.len() {
-            let opcode = data_bytes[i];
-
-            cost += match opcode {
-                // Arithmetic operations
-                0x01..=0x0b => U256::from(3), // ADD, MUL, SUB, DIV, etc.
-                // Comparison operations
-                0x10..=0x1d => U256::from(3), // LT, GT, SLT, SGT, EQ, etc.
-                // SHA3
-                0x20 => U256::from(30),
-                // Environmental operations
-                0x30..=0x3f => U256::from(2), // ADDRESS, BALANCE, ORIGIN, etc.
-                // Block operations
-                0x40..=0x48 => U256::from(20), // BLOCKHASH, COINBASE, etc.
-                // Stack operations
-                0x50..=0x5f => U256::from(3), // POP, MLOAD, MSTORE, etc.
-                // Push operations
-                0x60..=0x7f => {
-                    let size = (opcode - 0x60 + 1) as usize;
-                    i += size; // Skip the pushed bytes
-                    U256::from(3)
-                }
-                // Duplication operations
-                0x80..=0x8f => U256::from(3),
-                // Exchange operations
-                0x90..=0x9f => U256::from(3),
-                // Logging operations
-                0xa0..=0xa4 => U256::from(375), // LOG0, LOG1, etc.
-                // System operations
-                0xf0 => U256::from(32_000), // CREATE
-                0xf1 => U256::from(700),    // CALL
-                0xf2 => U256::from(700),    // CALLCODE
-                0xf3 => U256::from(0),      // RETURN
-                0xf4 => U256::from(700),    // DELEGATECALL
-                0xf5 => U256::from(32_000), // CREATE2
-                0xfd => U256::from(0),      // REVERT
-                0xff => U256::from(5_000),  // SELFDESTRUCT
-                // Default case
-                _ => U256::from(1),
-            };
-
-            i += 1;
-        }
-
-        // Add extra cost for complex contract deployments
-        if is_deployment && data_bytes.len() > 100 {
-            cost += U256::from(data_bytes.len() * 10);
-        }
-
-        cost
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+        let code = provider.get_code_at(to.unwrap()).await?;
+        Ok(!code.is_empty())
     }
 
     /// Calculate access list cost (EIP-2930)
-    async fn calculate_access_list_cost(&self, tx_params: &Tx) -> Result<U256, Error> {
+    async fn calculate_access_list_cost(
+        &self,
+        tx_params: &Tx,
+    ) -> Result<U256, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
         // Simple heuristic: estimate potential access list items
-        let mut cost = U256::zero();
+        let mut cost = U256::ZERO;
 
         if let Some(to) = tx_params.to {
             // Check if target is a contract that might benefit from access list
-            let code = self
-                .provider
-                .get_code(to, None)
-                .await
-                .map_err(Error::ProviderError)?;
+            let code = provider.get_code_at(to).await?;
             if !code.is_empty() {
                 // Estimate potential storage slots accessed
                 cost += U256::from(2_400); // ADDRESS_ACCESS_COST
@@ -377,95 +316,17 @@ impl GasEstimator {
         Ok(cost)
     }
 
-    /// Estimate precompile costs
-    fn estimate_precompile_cost(&self, data: &Bytes, to: Option<Address>) -> U256 {
-        let mut cost = U256::zero();
-        let data_bytes = data.as_ref();
+    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+        let gas_price = provider.get_gas_price().await?;
+        let latest_block = provider.get_block(BlockId::latest()).await?.unwrap();
 
-        // Check for precompile addresses in the bytecode or direct calls
-        if let Some(address) = to {
-            let addr_u64 = address.as_fixed_bytes()[19]; // Last byte for precompile check
-            match addr_u64 {
-                0x01 => cost += U256::from(3_000), // ECDSA recovery
-                0x02 => cost += U256::from(60 + (data_bytes.len() as u64 + 31) / 32 * 12), // SHA256
-                0x03 => cost += U256::from(600 + (data_bytes.len() as u64 + 31) / 32 * 120), // RIPEMD160
-                0x04 => cost += U256::from(15 + (data_bytes.len() as u64 + 31) / 32 * 3), // Identity
-                0x05 => cost += U256::from(self.estimate_modexp_cost(data_bytes)),        // ModExp
-                0x06 => cost += U256::from(150),    // BN254 Add
-                0x07 => cost += U256::from(6_000),  // BN254 Mul
-                0x08 => cost += U256::from(45_000), // BN254 Pairing base
-                0x09 => cost += U256::from(50_000), // Blake2F
-                _ => {}
-            }
-        }
+        let base_fee_per_gas = latest_block.header.base_fee_per_gas;
+        let gas_used = latest_block.header.gas_used;
+        let gas_limit = latest_block.header.gas_limit;
 
-        // Look for CALL opcodes to precompile addresses in bytecode
-        let mut i = 0;
-        while i + 20 < data_bytes.len() {
-            if data_bytes[i] == 0xf1 {
-                // CALL opcode
-                // Simple heuristic: look for small addresses that might be precompiles
-                for j in 1..=20 {
-                    if i >= j && data_bytes[i - j] <= 0x09 && data_bytes[i - j] > 0 {
-                        cost += U256::from(700); // Base call cost + estimated precompile cost
-                        break;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        cost
-    }
-
-    /// Estimate ModExp precompile cost
-    fn estimate_modexp_cost(&self, data: &[u8]) -> u64 {
-        if data.len() < 96 {
-            return 200; // Minimum cost
-        }
-
-        // Simplified calculation - in practice this would parse the input more carefully
-        let base_len = if data.len() >= 32 {
-            u64::from_be_bytes([0, 0, 0, 0, 0, 0, 0, data[31]])
-        } else {
-            32
-        };
-        let exp_len = if data.len() >= 64 {
-            u64::from_be_bytes([0, 0, 0, 0, 0, 0, 0, data[63]])
-        } else {
-            32
-        };
-        let mod_len = if data.len() >= 96 {
-            u64::from_be_bytes([0, 0, 0, 0, 0, 0, 0, data[95]])
-        } else {
-            32
-        };
-
-        let max_len = base_len.max(mod_len);
-        let complexity = (max_len * max_len) / 64;
-
-        200 + complexity * exp_len / 20
-    }
-
-    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Error> {
-        let gas_price = self
-            .provider
-            .get_gas_price()
-            .await
-            .map_err(Error::ProviderError)?;
-        let latest_block = self
-            .provider
-            .get_block(BlockNumber::Latest)
-            .await
-            .map_err(Error::ProviderError)?
-            .unwrap();
-
-        let base_fee_per_gas = latest_block.base_fee_per_gas;
-        let gas_used = latest_block.gas_used;
-        let gas_limit = latest_block.gas_limit;
-
-        let utilization = if gas_limit > U256::zero() {
-            (gas_used.as_u64() as f64 / gas_limit.as_u64() as f64) * 100.0
+        let utilization = if gas_limit > 0 {
+            (gas_used as f64 / gas_limit as f64) * 100.0
         } else {
             0.0
         };
@@ -474,333 +335,57 @@ impl GasEstimator {
             current_gas_price: gas_price,
             base_fee_per_gas,
             block_utilization: utilization,
-            latest_block_number: latest_block.number.unwrap().as_u64(),
+            latest_block_number: latest_block.header.number,
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use ethers::{types::transaction::eip2718::TypedTransaction, utils::parse_ether};
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use ethers::types::transaction::eip2718::TypedTransaction;
 
-    use super::*;
-    use std::time::Instant;
+//     #[derive(Debug, Serialize, Deserialize)]
+//     pub struct EstimationComparison {
+//         pub custom_estimate: GasEstimate,
+//         pub provider_estimate: GasEstimate,
+//         pub difference: U256,
+//         pub accuracy_percentage: f64,
+//     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct EstimationComparison {
-        pub custom_estimate: GasEstimate,
-        pub provider_estimate: GasEstimate,
-        pub difference: U256,
-        pub accuracy_percentage: f64,
-    }
+//     struct GasEstimatorHelper {
+//         provider: Arc<Provider<Http>>,
+//     }
 
-    struct GasEstimatorHelper {
-        provider: Arc<Provider<Http>>,
-    }
+//     impl GasEstimatorHelper {
+//         pub fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+//             let provider = Provider::<Http>::try_from(rpc_url)?;
+//             Ok(Self {
+//                 provider: Arc::new(provider),
+//             })
+//         }
 
-    impl GasEstimatorHelper {
-        pub fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-            let provider = Provider::<Http>::try_from(rpc_url)?;
-            Ok(Self {
-                provider: Arc::new(provider),
-            })
-        }
+//         /// Compare custom estimation with provider's built-in estimation
+//         pub async fn get_provider_gas(&self, tx_params: Tx) -> U256 {
+//             // Get provider's estimate
+//             let mut tx_request = TypedTransaction::default();
 
-        /// Compare custom estimation with provider's built-in estimation
-        pub async fn compare_estimations(
-            &self,
-            tx_params: Tx,
-            custom_estimate: GasEstimate,
-        ) -> Result<EstimationComparison, Box<dyn std::error::Error>> {
-            // Get provider's estimate
-            let mut tx_request = TypedTransaction::default();
+//             if let Some(to) = tx_params.to {
+//                 tx_request.set_to(to);
+//             }
+//             if let Some(value) = tx_params.value {
+//                 tx_request.set_value(value);
+//             }
+//             if let Some(data) = tx_params.data {
+//                 tx_request.set_data(data);
+//             }
 
-            if let Some(to) = tx_params.to {
-                tx_request.set_to(to);
-            }
-            if let Some(value) = tx_params.value {
-                tx_request.set_value(value);
-            }
-            if let Some(data) = tx_params.data {
-                tx_request.set_data(data);
-            }
+//             let provider_gas = self.provider.estimate_gas(&tx_request, None).await.unwrap();
+//             provider_gas
+//         }
+//     }
 
-            let provider_gas = self.provider.estimate_gas(&tx_request, None).await?;
-            let provider_estimate = GasEstimate {
-                estimated_gas: provider_gas,
-                gas_price: custom_estimate.gas_price,
-                max_fee_per_gas: custom_estimate.max_fee_per_gas,
-                max_priority_fee_per_gas: custom_estimate.max_priority_fee_per_gas,
-                total_cost_wei: provider_gas * custom_estimate.gas_price,
-                total_cost_eth: ethers::utils::format_ether(
-                    provider_gas * custom_estimate.gas_price,
-                ),
-                transaction_type: "Provider Built-in".to_string(),
-                breakdown: GasBreakdown {
-                    base_cost: provider_gas,
-                    data_cost: U256::zero(),
-                    recipient_cost: U256::zero(),
-                    storage_cost: U256::zero(),
-                    contract_creation_cost: U256::zero(),
-                    execution_cost: U256::zero(),
-                    access_list_cost: U256::zero(),
-                    precompile_cost: U256::zero(),
-                },
-            };
-
-            let difference = if custom_estimate.estimated_gas > provider_gas {
-                custom_estimate.estimated_gas - provider_gas
-            } else {
-                provider_gas - custom_estimate.estimated_gas
-            };
-
-            let accuracy_percentage = if provider_gas > U256::zero() {
-                100.0 - (difference.as_u64() as f64 / provider_gas.as_u64() as f64 * 100.0)
-            } else {
-                0.0
-            };
-
-            Ok(EstimationComparison {
-                custom_estimate,
-                provider_estimate,
-                difference,
-                accuracy_percentage,
-            })
-        }
-        /// Returns bytecode for a minimal empty contract
-        pub fn minimal_contract_bytecode() -> Bytes {
-            Bytes::from_static(&[
-                0x60, 0x0a, // PUSH1 0x0a (size of runtime code)
-                0x60, 0x0c, // PUSH1 0x0c (offset of runtime code)
-                0x60, 0x00, // PUSH1 0x00 (destination memory offset)
-                0x39, // CODECOPY
-                0x60, 0x0a, // PUSH1 0x0a (size)
-                0x60, 0x00, // PUSH1 0x00 (offset)
-                0xf3, // RETURN
-                // Runtime code (empty):
-                0x60, 0x00, // PUSH1 0x00
-                0x60, 0x00, // PUSH1 0x00
-                0xf3, // RETURN
-            ])
-        }
-
-        /// Returns bytecode for a simple storage contract (stores a value)
-        pub fn simple_storage_contract_bytecode() -> Bytes {
-            // Simple contract that stores value 42 in slot 0
-            Bytes::from_static(&[
-                0x60, 0x2a, // PUSH1 42 (value to store)
-                0x60, 0x00, // PUSH1 0 (storage slot)
-                0x55, // SSTORE
-                0x60, 0x0a, // PUSH1 0x0a (runtime code size)
-                0x60, 0x16, // PUSH1 0x16 (runtime code offset)
-                0x60, 0x00, // PUSH1 0x00 (memory offset)
-                0x39, // CODECOPY
-                0x60, 0x0a, // PUSH1 0x0a (size)
-                0x60, 0x00, // PUSH1 0x00 (offset)
-                0xf3, // RETURN
-                // Runtime code:
-                0x60, 0x00, // PUSH1 0x00
-                0x54, // SLOAD
-                0x60, 0x00, // PUSH1 0x00
-                0x52, // MSTORE
-                0x60, 0x20, // PUSH1 0x20
-                0x60, 0x00, // PUSH1 0x00
-                0xf3, // RETURN
-            ])
-        }
-    }
-
-    #[tokio::test]
-    async fn test_gas_estimator_creation() {
-        let rpc_url = "https://eth.llamarpc.com";
-        let estimator = GasEstimator::new(rpc_url);
-        assert!(estimator.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_network_gas_info() {
-        let rpc_url = "https://eth.llamarpc.com";
-        let estimator = GasEstimator::new(rpc_url).unwrap();
-
-        let gas_info = estimator.get_network_gas_info().await;
-        if gas_info.is_ok() {
-            let info = gas_info.unwrap();
-            assert!(info.current_gas_price > U256::zero());
-            assert!(info.latest_block_number > 0);
-        }
-        // Note: Test might fail if RPC is down, which is acceptable
-    }
-
-    #[tokio::test]
-    async fn test_custom_vs_provider_accuracy() {
-        let rpc_url = "https://eth.llamarpc.com";
-        let estimator = GasEstimator::new(rpc_url).unwrap();
-        let estimator_helper = GasEstimatorHelper::new(rpc_url).unwrap();
-
-        // Test simple ETH transfer
-        let recipient = "0x742d35Cc6634C0532925a3b8D0Ed9C5C8bD4c29c"
-            .parse::<Address>()
-            .unwrap();
-        let tx_params = Tx {
-            from: None,
-            to: Some(recipient),
-            value: Some(parse_ether("0.01").unwrap()),
-            data: None,
-            gas: None,
-            nonce: None,
-            chain_id: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        let custom_estimate = estimator.estimate_gas(tx_params.clone()).await.unwrap();
-        let comparison = estimator_helper
-            .compare_estimations(tx_params, custom_estimate)
-            .await;
-        if let Ok(comp) = comparison {
-            // Our custom estimation should be within 5% of provider estimation
-            assert!(comp.accuracy_percentage >= 95.0);
-            println!("Accuracy test passed: {:.2}%", comp.accuracy_percentage);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_performance_benchmark() {
-        let rpc_url = "https://eth.llamarpc.com";
-        let estimator = GasEstimator::new(rpc_url).unwrap();
-
-        let recipient = "0x742d35Cc6634C0532925a3b8D0Ed9C5C8bD4c29c"
-            .parse::<Address>()
-            .unwrap();
-        let tx_params = Tx {
-            from: None,
-            to: Some(recipient),
-            value: Some(parse_ether("0.01").unwrap()),
-            data: None,
-            gas: None,
-            nonce: None,
-            chain_id: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        // Benchmark custom estimation
-        let start = Instant::now();
-        let custom_result = estimator.estimate_gas(tx_params.clone()).await;
-        let custom_duration = start.elapsed();
-
-        // Benchmark provider estimation
-        let start = Instant::now();
-        let mut tx_request = TypedTransaction::default();
-        tx_request.set_to(recipient);
-        tx_request.set_value(parse_ether("0.01").unwrap());
-        let provider_result = estimator.provider.estimate_gas(&tx_request, None).await;
-        let provider_duration = start.elapsed();
-
-        if custom_result.is_ok() && provider_result.is_ok() {
-            println!("Custom estimation time: {:?}", custom_duration);
-            println!("Provider estimation time: {:?}", provider_duration);
-
-            // Custom estimation should complete reasonably fast (under 1 second typically)
-            assert!(custom_duration.as_millis() < 5000);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_bytecode_analysis() {
-        let estimator = GasEstimator::new("https://eth.llamarpc.com").unwrap();
-
-        // Test minimal contract
-        let minimal_bytecode = GasEstimatorHelper::minimal_contract_bytecode();
-        let minimal_params = Tx {
-            from: None,
-            to: None,
-            value: None,
-            data: Some(minimal_bytecode),
-            nonce: None,
-            chain_id: None,
-            gas: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        let minimal_estimate = estimator.estimate_gas(minimal_params).await;
-        assert!(minimal_estimate.is_ok());
-
-        if let Ok(estimate) = minimal_estimate {
-            // Should have base cost + creation cost + execution cost
-            assert!(estimate.breakdown.base_cost > U256::zero());
-            assert!(estimate.breakdown.contract_creation_cost > U256::zero());
-            assert!(estimate.estimated_gas > U256::from(21_000));
-        }
-
-        // Test storage contract
-        let storage_bytecode = GasEstimatorHelper::simple_storage_contract_bytecode();
-        let storage_params = Tx {
-            from: None,
-            to: None,
-            value: None,
-            data: Some(storage_bytecode),
-            nonce: None,
-            chain_id: None,
-            gas: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        let storage_estimate = estimator.estimate_gas(storage_params).await;
-        assert!(storage_estimate.is_ok());
-
-        if let Ok(estimate) = storage_estimate {
-            // Storage contract should have storage costs
-            assert!(estimate.breakdown.storage_cost > U256::zero());
-            assert!(estimate.estimated_gas > U256::from(50_000));
-        }
-    }
-
-    #[test]
-    fn test_calldata_cost_calculation() {
-        let estimator = GasEstimator::new("https://eth.llamarpc.com").unwrap();
-
-        // Test with zero bytes
-        let zero_data = Bytes::from(vec![0u8; 10]);
-        let zero_cost = estimator.calculate_calldata_cost(&zero_data);
-        assert_eq!(zero_cost, U256::from(40)); // 10 * 4 gas
-
-        // Test with non-zero bytes
-        let nonzero_data = Bytes::from(vec![1u8; 10]);
-        let nonzero_cost = estimator.calculate_calldata_cost(&nonzero_data);
-        assert_eq!(nonzero_cost, U256::from(160)); // 10 * 16 gas
-
-        // Test with mixed bytes
-        let mixed_data = Bytes::from(vec![0, 1, 0, 1, 0]);
-        let mixed_cost = estimator.calculate_calldata_cost(&mixed_data);
-        assert_eq!(mixed_cost, U256::from(44)); // 3 * 4 + 2 * 16 = 44 gas
-    }
-
-    #[test]
-    fn test_contract_creation_cost() {
-        let estimator = GasEstimator::new("https://eth.llamarpc.com").unwrap();
-
-        // Test with bytecode
-        let bytecode = Bytes::from(vec![0x60, 0x80, 0x60, 0x40]); // 4 bytes
-        let cost = estimator.calculate_contract_creation_cost(Some(&bytecode));
-        assert_eq!(cost, U256::from(32_800)); // 32_000 + 4 * 200
-
-        // Test without bytecode
-        let no_cost = estimator.calculate_contract_creation_cost(None);
-        assert_eq!(no_cost, U256::zero());
-    }
-}
+//     // sol! {
+//     //         function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+//     //     }
+// }

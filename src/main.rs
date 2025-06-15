@@ -1,6 +1,7 @@
 mod error;
 mod gas_estimator;
 mod rpc_server;
+mod utils;
 
 use gas_estimator::GasEstimator;
 use rpc_server::RpcServer;
@@ -18,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test connection to the RPC endpoint
     println!("Testing connection to Ethereum network...");
-    match GasEstimator::new(&default_rpc_url) {
+    match GasEstimator::new(&default_rpc_url).await {
         Ok(estimator) => match estimator.get_network_gas_info().await {
             Ok(network_info) => {
                 println!("    Connected to Ethereum network!");
