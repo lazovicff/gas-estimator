@@ -1,0 +1,14 @@
+[package]
+name = "gas-estimator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ethers = "2.0"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+jsonrpsee = { version = "0.20", features = ["server", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.4", features = ["cors"] }
