@@ -94,13 +94,10 @@ impl RpcServer {
             .await?;
 
         let addr = server.local_addr()?;
-
         // Create the RPC implementation
         let rpc_impl = GasEstimationRpcImpl::new(default_rpc_url);
-
         // Start the server
         let handle = server.start(rpc_impl.into_rpc());
-
         Ok(Self { handle, addr })
     }
 
@@ -113,10 +110,6 @@ impl RpcServer {
             .stop()
             .map_err(|e| format!("Failed to stop server: {:?}", e))?;
         Ok(())
-    }
-
-    pub fn handle(&self) -> &ServerHandle {
-        &self.handle
     }
 }
 

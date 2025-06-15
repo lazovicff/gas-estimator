@@ -12,3 +12,4 @@ hex = "0.4"
 jsonrpsee = { version = "0.20", features = ["server", "macros"] }
 tower = "0.4"
 tower-http = { version = "0.4", features = ["cors"] }
+thiserror = "2.0.12"

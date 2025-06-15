@@ -1,14 +1,12 @@
 use ethers::{
     prelude::*,
     providers::{Http, Provider},
-    types::{
-        transaction::{eip2718::TypedTransaction, eip2930::AccessList},
-        Address, Bytes, U256, U64,
-    },
-    utils::parse_ether,
+    types::{transaction::eip2930::AccessList, Address, Bytes, U256, U64},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+use crate::error::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
@@ -65,6 +63,14 @@ pub struct GasBreakdown {
     pub precompile_cost: U256,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkGasInfo {
+    pub current_gas_price: U256,
+    pub base_fee_per_gas: Option<U256>,
+    pub block_utilization: f64,
+    pub latest_block_number: u64,
+}
+
 pub struct GasEstimator {
     provider: Arc<Provider<Http>>,
 }
@@ -77,80 +83,8 @@ impl GasEstimator {
         })
     }
 
-    /// Returns bytecode for a minimal empty contract
-    pub fn minimal_contract_bytecode() -> Bytes {
-        Bytes::from_static(&[
-            0x60, 0x0a, // PUSH1 0x0a (size of runtime code)
-            0x60, 0x0c, // PUSH1 0x0c (offset of runtime code)
-            0x60, 0x00, // PUSH1 0x00 (destination memory offset)
-            0x39, // CODECOPY
-            0x60, 0x0a, // PUSH1 0x0a (size)
-            0x60, 0x00, // PUSH1 0x00 (offset)
-            0xf3, // RETURN
-            // Runtime code (empty):
-            0x60, 0x00, // PUSH1 0x00
-            0x60, 0x00, // PUSH1 0x00
-            0xf3, // RETURN
-        ])
-    }
-
-    /// Returns bytecode for a simple storage contract (stores a value)
-    pub fn simple_storage_contract_bytecode() -> Bytes {
-        // Simple contract that stores value 42 in slot 0
-        Bytes::from_static(&[
-            0x60, 0x2a, // PUSH1 42 (value to store)
-            0x60, 0x00, // PUSH1 0 (storage slot)
-            0x55, // SSTORE
-            0x60, 0x0a, // PUSH1 0x0a (runtime code size)
-            0x60, 0x16, // PUSH1 0x16 (runtime code offset)
-            0x60, 0x00, // PUSH1 0x00 (memory offset)
-            0x39, // CODECOPY
-            0x60, 0x0a, // PUSH1 0x0a (size)
-            0x60, 0x00, // PUSH1 0x00 (offset)
-            0xf3, // RETURN
-            // Runtime code:
-            0x60, 0x00, // PUSH1 0x00
-            0x54, // SLOAD
-            0x60, 0x00, // PUSH1 0x00
-            0x52, // MSTORE
-            0x60, 0x20, // PUSH1 0x20
-            0x60, 0x00, // PUSH1 0x00
-            0xf3, // RETURN
-        ])
-    }
-
-    /// Returns bytecode for a contract that uses precompiles
-    pub fn precompile_contract_bytecode() -> Bytes {
-        // Contract that calls SHA256 precompile (address 0x02)
-        Bytes::from_static(&[
-            0x60, 0x20, // PUSH1 0x20 (size = 32 bytes)
-            0x60, 0x00, // PUSH1 0x00 (offset)
-            0x60, 0x20, // PUSH1 0x20 (retSize)
-            0x60, 0x00, // PUSH1 0x00 (retOffset)
-            0x60, 0x00, // PUSH1 0x00 (argsSize)
-            0x60, 0x00, // PUSH1 0x00 (argsOffset)
-            0x60, 0x02, // PUSH1 0x02 (SHA256 precompile address)
-            0x61, 0x27, 0x10, // PUSH2 0x2710 (10000 gas)
-            0xf1, // CALL
-            0x60, 0x08, // PUSH1 0x08 (runtime code size)
-            0x60, 0x12, // PUSH1 0x12 (runtime code offset)
-            0x60, 0x00, // PUSH1 0x00 (memory offset)
-            0x39, // CODECOPY
-            0x60, 0x08, // PUSH1 0x08 (size)
-            0x60, 0x00, // PUSH1 0x00 (offset)
-            0xf3, // RETURN
-            // Runtime code:
-            0x60, 0x00, // PUSH1 0x00
-            0x60, 0x00, // PUSH1 0x00
-            0xf3, // RETURN
-        ])
-    }
-
     /// Custom gas estimation implementation from scratch
-    pub async fn estimate_gas(
-        &self,
-        tx_params: Tx,
-    ) -> Result<GasEstimate, Box<dyn std::error::Error>> {
+    pub async fn estimate_gas(&self, tx_params: Tx) -> Result<GasEstimate, Error> {
         // Calculate gas breakdown using our custom logic
         let breakdown = self.calculate_gas_breakdown(&tx_params).await?;
 
@@ -167,7 +101,10 @@ impl GasEstimator {
         let gas_price = if let Some(price) = tx_params.gas_price {
             price
         } else {
-            self.provider.get_gas_price().await?
+            self.provider
+                .get_gas_price()
+                .await
+                .map_err(Error::ProviderError)?
         };
 
         // Try to get EIP-1559 fee data
@@ -181,7 +118,8 @@ impl GasEstimator {
             let base_fee = self
                 .provider
                 .get_block(BlockNumber::Latest)
-                .await?
+                .await
+                .map_err(Error::ProviderError)?
                 .unwrap()
                 .base_fee_per_gas
                 .unwrap_or(gas_price);
@@ -221,73 +159,8 @@ impl GasEstimator {
         })
     }
 
-    /// Compare custom estimation with provider's built-in estimation
-    pub async fn compare_estimations(
-        &self,
-        tx_params: Tx,
-    ) -> Result<EstimationComparison, Box<dyn std::error::Error>> {
-        // Get our custom estimate
-        let custom_estimate = self.estimate_gas(tx_params.clone()).await?;
-
-        // Get provider's estimate
-        let mut tx_request = TypedTransaction::default();
-
-        if let Some(to) = tx_params.to {
-            tx_request.set_to(to);
-        }
-        if let Some(value) = tx_params.value {
-            tx_request.set_value(value);
-        }
-        if let Some(data) = tx_params.data {
-            tx_request.set_data(data);
-        }
-
-        let provider_gas = self.provider.estimate_gas(&tx_request, None).await?;
-        let provider_estimate = GasEstimate {
-            estimated_gas: provider_gas,
-            gas_price: custom_estimate.gas_price,
-            max_fee_per_gas: custom_estimate.max_fee_per_gas,
-            max_priority_fee_per_gas: custom_estimate.max_priority_fee_per_gas,
-            total_cost_wei: provider_gas * custom_estimate.gas_price,
-            total_cost_eth: ethers::utils::format_ether(provider_gas * custom_estimate.gas_price),
-            transaction_type: "Provider Built-in".to_string(),
-            breakdown: GasBreakdown {
-                base_cost: provider_gas,
-                data_cost: U256::zero(),
-                recipient_cost: U256::zero(),
-                storage_cost: U256::zero(),
-                contract_creation_cost: U256::zero(),
-                execution_cost: U256::zero(),
-                access_list_cost: U256::zero(),
-                precompile_cost: U256::zero(),
-            },
-        };
-
-        let difference = if custom_estimate.estimated_gas > provider_gas {
-            custom_estimate.estimated_gas - provider_gas
-        } else {
-            provider_gas - custom_estimate.estimated_gas
-        };
-
-        let accuracy_percentage = if provider_gas > U256::zero() {
-            100.0 - (difference.as_u64() as f64 / provider_gas.as_u64() as f64 * 100.0)
-        } else {
-            0.0
-        };
-
-        Ok(EstimationComparison {
-            custom_estimate,
-            provider_estimate,
-            difference,
-            accuracy_percentage,
-        })
-    }
-
     /// Calculate detailed gas breakdown from scratch
-    async fn calculate_gas_breakdown(
-        &self,
-        tx_params: &Tx,
-    ) -> Result<GasBreakdown, Box<dyn std::error::Error>> {
+    async fn calculate_gas_breakdown(&self, tx_params: &Tx) -> Result<GasBreakdown, Error> {
         // Base transaction cost (21,000 gas for simple transfers)
         let base_cost = U256::from(21_000);
 
@@ -307,7 +180,7 @@ impl GasEstimator {
 
         // Calculate storage operations cost
         let storage_cost = if let Some(ref data) = tx_params.data {
-            self.estimate_storage_cost(data).await?
+            self.estimate_storage_cost(data)
         } else {
             U256::zero()
         };
@@ -322,7 +195,6 @@ impl GasEstimator {
         // Calculate execution cost (opcode simulation)
         let execution_cost = if let Some(ref data) = tx_params.data {
             self.estimate_execution_cost(data, tx_params.to.is_none())
-                .await?
         } else {
             U256::zero()
         };
@@ -349,54 +221,6 @@ impl GasEstimator {
         })
     }
 
-    pub async fn estimate_transfer_gas(
-        &self,
-        to: Address,
-        amount_eth: &str,
-    ) -> Result<GasEstimate, Box<dyn std::error::Error>> {
-        let value = parse_ether(amount_eth)?;
-        let tx_params = Tx {
-            from: None,
-            to: Some(to),
-            value: Some(value),
-            data: None,
-            nonce: None,
-            chain_id: None,
-            gas: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        self.estimate_gas(tx_params).await
-    }
-
-    pub async fn estimate_contract_call_gas(
-        &self,
-        contract_address: Address,
-        data: Bytes,
-        value: Option<U256>,
-    ) -> Result<GasEstimate, Box<dyn std::error::Error>> {
-        let tx_params = Tx {
-            from: None,
-            to: Some(contract_address),
-            value,
-            data: Some(data),
-            nonce: None,
-            chain_id: None,
-            gas: None,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-            access_list: None,
-            transaction_type: None,
-        };
-
-        self.estimate_gas(tx_params).await
-    }
-
     /// Calculate gas cost for calldata (transaction input data)
     fn calculate_calldata_cost(&self, data: &Bytes) -> U256 {
         let mut cost = U256::zero();
@@ -415,12 +239,13 @@ impl GasEstimator {
     }
 
     /// Calculate cost based on recipient (contract vs EOA)
-    async fn calculate_recipient_cost(
-        &self,
-        to: Address,
-    ) -> Result<U256, Box<dyn std::error::Error>> {
+    async fn calculate_recipient_cost(&self, to: Address) -> Result<U256, Error> {
         // Check if the recipient is a contract by looking for code
-        let code = self.provider.get_code(to, None).await?;
+        let code = self
+            .provider
+            .get_code(to, None)
+            .await
+            .map_err(Error::ProviderError)?;
 
         if code.is_empty() {
             // External Owned Account (EOA) - no additional cost
@@ -432,10 +257,7 @@ impl GasEstimator {
     }
 
     /// Estimate storage operations cost
-    async fn estimate_storage_cost(
-        &self,
-        data: &Bytes,
-    ) -> Result<U256, Box<dyn std::error::Error>> {
+    fn estimate_storage_cost(&self, data: &Bytes) -> U256 {
         let mut cost = U256::zero();
 
         // Simple heuristic: look for SSTORE-like patterns in bytecode
@@ -459,7 +281,7 @@ impl GasEstimator {
             }
         }
 
-        Ok(cost)
+        cost
     }
 
     /// Calculate contract creation cost
@@ -467,10 +289,8 @@ impl GasEstimator {
         if let Some(bytecode) = data {
             // Base cost for contract creation
             let mut cost = U256::from(32_000);
-
             // Additional cost per byte of bytecode
             cost += U256::from(bytecode.len() * 200);
-
             cost
         } else {
             U256::zero()
@@ -478,11 +298,7 @@ impl GasEstimator {
     }
 
     /// Estimate execution cost by analyzing opcodes
-    async fn estimate_execution_cost(
-        &self,
-        data: &Bytes,
-        is_deployment: bool,
-    ) -> Result<U256, Box<dyn std::error::Error>> {
+    fn estimate_execution_cost(&self, data: &Bytes, is_deployment: bool) -> U256 {
         let mut cost = U256::zero();
         let data_bytes = data.as_ref();
         let mut i = 0;
@@ -493,38 +309,28 @@ impl GasEstimator {
             cost += match opcode {
                 // Arithmetic operations
                 0x01..=0x0b => U256::from(3), // ADD, MUL, SUB, DIV, etc.
-
                 // Comparison operations
                 0x10..=0x1d => U256::from(3), // LT, GT, SLT, SGT, EQ, etc.
-
                 // SHA3
                 0x20 => U256::from(30),
-
                 // Environmental operations
                 0x30..=0x3f => U256::from(2), // ADDRESS, BALANCE, ORIGIN, etc.
-
                 // Block operations
                 0x40..=0x48 => U256::from(20), // BLOCKHASH, COINBASE, etc.
-
                 // Stack operations
                 0x50..=0x5f => U256::from(3), // POP, MLOAD, MSTORE, etc.
-
                 // Push operations
                 0x60..=0x7f => {
                     let size = (opcode - 0x60 + 1) as usize;
                     i += size; // Skip the pushed bytes
                     U256::from(3)
                 }
-
                 // Duplication operations
                 0x80..=0x8f => U256::from(3),
-
                 // Exchange operations
                 0x90..=0x9f => U256::from(3),
-
                 // Logging operations
                 0xa0..=0xa4 => U256::from(375), // LOG0, LOG1, etc.
-
                 // System operations
                 0xf0 => U256::from(32_000), // CREATE
                 0xf1 => U256::from(700),    // CALL
@@ -534,7 +340,6 @@ impl GasEstimator {
                 0xf5 => U256::from(32_000), // CREATE2
                 0xfd => U256::from(0),      // REVERT
                 0xff => U256::from(5_000),  // SELFDESTRUCT
-
                 // Default case
                 _ => U256::from(1),
             };
@@ -547,20 +352,21 @@ impl GasEstimator {
             cost += U256::from(data_bytes.len() * 10);
         }
 
-        Ok(cost)
+        cost
     }
 
     /// Calculate access list cost (EIP-2930)
-    async fn calculate_access_list_cost(
-        &self,
-        tx_params: &Tx,
-    ) -> Result<U256, Box<dyn std::error::Error>> {
+    async fn calculate_access_list_cost(&self, tx_params: &Tx) -> Result<U256, Error> {
         // Simple heuristic: estimate potential access list items
         let mut cost = U256::zero();
 
         if let Some(to) = tx_params.to {
             // Check if target is a contract that might benefit from access list
-            let code = self.provider.get_code(to, None).await?;
+            let code = self
+                .provider
+                .get_code(to, None)
+                .await
+                .map_err(Error::ProviderError)?;
             if !code.is_empty() {
                 // Estimate potential storage slots accessed
                 cost += U256::from(2_400); // ADDRESS_ACCESS_COST
@@ -641,9 +447,18 @@ impl GasEstimator {
         200 + complexity * exp_len / 20
     }
 
-    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {
-        let gas_price = self.provider.get_gas_price().await?;
-        let latest_block = self.provider.get_block(BlockNumber::Latest).await?.unwrap();
+    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Error> {
+        let gas_price = self
+            .provider
+            .get_gas_price()
+            .await
+            .map_err(Error::ProviderError)?;
+        let latest_block = self
+            .provider
+            .get_block(BlockNumber::Latest)
+            .await
+            .map_err(Error::ProviderError)?
+            .unwrap();
 
         let base_fee_per_gas = latest_block.base_fee_per_gas;
         let gas_used = latest_block.gas_used;
@@ -664,26 +479,136 @@ impl GasEstimator {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NetworkGasInfo {
-    pub current_gas_price: U256,
-    pub base_fee_per_gas: Option<U256>,
-    pub block_utilization: f64,
-    pub latest_block_number: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EstimationComparison {
-    pub custom_estimate: GasEstimate,
-    pub provider_estimate: GasEstimate,
-    pub difference: U256,
-    pub accuracy_percentage: f64,
-}
-
 #[cfg(test)]
 mod tests {
+    use ethers::{types::transaction::eip2718::TypedTransaction, utils::parse_ether};
+
     use super::*;
     use std::time::Instant;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct EstimationComparison {
+        pub custom_estimate: GasEstimate,
+        pub provider_estimate: GasEstimate,
+        pub difference: U256,
+        pub accuracy_percentage: f64,
+    }
+
+    struct GasEstimatorHelper {
+        provider: Arc<Provider<Http>>,
+    }
+
+    impl GasEstimatorHelper {
+        pub fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let provider = Provider::<Http>::try_from(rpc_url)?;
+            Ok(Self {
+                provider: Arc::new(provider),
+            })
+        }
+
+        /// Compare custom estimation with provider's built-in estimation
+        pub async fn compare_estimations(
+            &self,
+            tx_params: Tx,
+            custom_estimate: GasEstimate,
+        ) -> Result<EstimationComparison, Box<dyn std::error::Error>> {
+            // Get provider's estimate
+            let mut tx_request = TypedTransaction::default();
+
+            if let Some(to) = tx_params.to {
+                tx_request.set_to(to);
+            }
+            if let Some(value) = tx_params.value {
+                tx_request.set_value(value);
+            }
+            if let Some(data) = tx_params.data {
+                tx_request.set_data(data);
+            }
+
+            let provider_gas = self.provider.estimate_gas(&tx_request, None).await?;
+            let provider_estimate = GasEstimate {
+                estimated_gas: provider_gas,
+                gas_price: custom_estimate.gas_price,
+                max_fee_per_gas: custom_estimate.max_fee_per_gas,
+                max_priority_fee_per_gas: custom_estimate.max_priority_fee_per_gas,
+                total_cost_wei: provider_gas * custom_estimate.gas_price,
+                total_cost_eth: ethers::utils::format_ether(
+                    provider_gas * custom_estimate.gas_price,
+                ),
+                transaction_type: "Provider Built-in".to_string(),
+                breakdown: GasBreakdown {
+                    base_cost: provider_gas,
+                    data_cost: U256::zero(),
+                    recipient_cost: U256::zero(),
+                    storage_cost: U256::zero(),
+                    contract_creation_cost: U256::zero(),
+                    execution_cost: U256::zero(),
+                    access_list_cost: U256::zero(),
+                    precompile_cost: U256::zero(),
+                },
+            };
+
+            let difference = if custom_estimate.estimated_gas > provider_gas {
+                custom_estimate.estimated_gas - provider_gas
+            } else {
+                provider_gas - custom_estimate.estimated_gas
+            };
+
+            let accuracy_percentage = if provider_gas > U256::zero() {
+                100.0 - (difference.as_u64() as f64 / provider_gas.as_u64() as f64 * 100.0)
+            } else {
+                0.0
+            };
+
+            Ok(EstimationComparison {
+                custom_estimate,
+                provider_estimate,
+                difference,
+                accuracy_percentage,
+            })
+        }
+        /// Returns bytecode for a minimal empty contract
+        pub fn minimal_contract_bytecode() -> Bytes {
+            Bytes::from_static(&[
+                0x60, 0x0a, // PUSH1 0x0a (size of runtime code)
+                0x60, 0x0c, // PUSH1 0x0c (offset of runtime code)
+                0x60, 0x00, // PUSH1 0x00 (destination memory offset)
+                0x39, // CODECOPY
+                0x60, 0x0a, // PUSH1 0x0a (size)
+                0x60, 0x00, // PUSH1 0x00 (offset)
+                0xf3, // RETURN
+                // Runtime code (empty):
+                0x60, 0x00, // PUSH1 0x00
+                0x60, 0x00, // PUSH1 0x00
+                0xf3, // RETURN
+            ])
+        }
+
+        /// Returns bytecode for a simple storage contract (stores a value)
+        pub fn simple_storage_contract_bytecode() -> Bytes {
+            // Simple contract that stores value 42 in slot 0
+            Bytes::from_static(&[
+                0x60, 0x2a, // PUSH1 42 (value to store)
+                0x60, 0x00, // PUSH1 0 (storage slot)
+                0x55, // SSTORE
+                0x60, 0x0a, // PUSH1 0x0a (runtime code size)
+                0x60, 0x16, // PUSH1 0x16 (runtime code offset)
+                0x60, 0x00, // PUSH1 0x00 (memory offset)
+                0x39, // CODECOPY
+                0x60, 0x0a, // PUSH1 0x0a (size)
+                0x60, 0x00, // PUSH1 0x00 (offset)
+                0xf3, // RETURN
+                // Runtime code:
+                0x60, 0x00, // PUSH1 0x00
+                0x54, // SLOAD
+                0x60, 0x00, // PUSH1 0x00
+                0x52, // MSTORE
+                0x60, 0x20, // PUSH1 0x20
+                0x60, 0x00, // PUSH1 0x00
+                0xf3, // RETURN
+            ])
+        }
+    }
 
     #[tokio::test]
     async fn test_gas_estimator_creation() {
@@ -710,6 +635,7 @@ mod tests {
     async fn test_custom_vs_provider_accuracy() {
         let rpc_url = "https://eth.llamarpc.com";
         let estimator = GasEstimator::new(rpc_url).unwrap();
+        let estimator_helper = GasEstimatorHelper::new(rpc_url).unwrap();
 
         // Test simple ETH transfer
         let recipient = "0x742d35Cc6634C0532925a3b8D0Ed9C5C8bD4c29c"
@@ -730,7 +656,10 @@ mod tests {
             transaction_type: None,
         };
 
-        let comparison = estimator.compare_estimations(tx_params).await;
+        let custom_estimate = estimator.estimate_gas(tx_params.clone()).await.unwrap();
+        let comparison = estimator_helper
+            .compare_estimations(tx_params, custom_estimate)
+            .await;
         if let Ok(comp) = comparison {
             // Our custom estimation should be within 5% of provider estimation
             assert!(comp.accuracy_percentage >= 95.0);
@@ -788,7 +717,7 @@ mod tests {
         let estimator = GasEstimator::new("https://eth.llamarpc.com").unwrap();
 
         // Test minimal contract
-        let minimal_bytecode = GasEstimator::minimal_contract_bytecode();
+        let minimal_bytecode = GasEstimatorHelper::minimal_contract_bytecode();
         let minimal_params = Tx {
             from: None,
             to: None,
@@ -815,7 +744,7 @@ mod tests {
         }
 
         // Test storage contract
-        let storage_bytecode = GasEstimator::simple_storage_contract_bytecode();
+        let storage_bytecode = GasEstimatorHelper::simple_storage_contract_bytecode();
         let storage_params = Tx {
             from: None,
             to: None,
