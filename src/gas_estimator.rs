@@ -1,4 +1,4 @@
-use crate::utils::calculate_calldata_cost;
+use crate::utils::{calculate_calldata_cost, calculate_contract_creation_cost};
 use alloy::{
     eips::BlockId,
     providers::{Provider, ProviderBuilder},
@@ -6,8 +6,8 @@ use alloy::{
 use revm::{
     context::{transaction::AccessList, tx::TxEnvBuilder},
     database::{CacheDB, EmptyDB},
-    primitives::{alloy_primitives::U64, Address, Bytes, TxKind, U256},
-    state::AccountInfo,
+    primitives::{alloy_primitives::U64, keccak256, Address, Bytes, TxKind, U256},
+    state::{AccountInfo, Bytecode},
     Context, ExecuteEvm, MainBuilder, MainContext,
 };
 use serde::{Deserialize, Serialize};
@@ -123,16 +123,38 @@ impl GasEstimator {
         let execution_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
             let mut cache_db = CacheDB::new(EmptyDB::default());
 
-            // Add balance to the caller account to avoid LackOfFundForMaxFee error
+            // Get actual balance from the provider
             let caller = tx_params.from.unwrap();
-            let balance = U256::from(10u128.pow(18) * 1000); // 1000 ETH
+            let balance = provider.get_balance(caller).await.unwrap_or_else(|_| {
+                // Fallback to a reasonable amount if balance fetch fails
+                U256::from(10u128.pow(18) * 1000) // 1000 ETH
+            });
+            let nonce = provider.get_transaction_count(caller).await.unwrap_or(0);
+
             cache_db.insert_account_info(
                 caller,
                 AccountInfo {
                     balance,
-                    nonce: tx_params.nonce.unwrap_or(0),
+                    nonce: tx_params.nonce.unwrap_or(nonce),
                     code_hash: revm::primitives::KECCAK_EMPTY,
                     code: None,
+                },
+            );
+
+            // Get contract code from provider and add it to cache
+            let contract_address = tx_params.to.unwrap();
+            let contract_code = provider
+                .get_code_at(contract_address)
+                .await
+                .unwrap_or_default();
+            assert!(!contract_code.is_empty());
+            cache_db.insert_account_info(
+                contract_address,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 0,
+                    code_hash: keccak256(&contract_code),
+                    code: Some(Bytecode::new_raw(contract_code)),
                 },
             );
 
@@ -175,45 +197,7 @@ impl GasEstimator {
 
         // Calculate contract creation cost
         let contract_creation_cost = if tx_params.to.is_none() {
-            let mut cache_db = CacheDB::new(EmptyDB::default());
-
-            // Add balance to the caller account to avoid LackOfFundForMaxFee error
-            let caller = tx_params.from.unwrap();
-            let balance = U256::from(10u128.pow(18) * 1000); // 1000 ETH
-            cache_db.insert_account_info(
-                caller,
-                AccountInfo {
-                    balance,
-                    nonce: tx_params.nonce.unwrap_or(0),
-                    code_hash: revm::primitives::KECCAK_EMPTY,
-                    code: None,
-                },
-            );
-
-            let mut evm = Context::mainnet().with_db(cache_db).build_mainnet();
-            let tx_evm = TxEnvBuilder::new()
-                .caller(caller)
-                .kind(TxKind::Create) // Creating a contract
-                .data(tx_params.data.clone().unwrap())
-                .value(tx_params.value)
-                .gas_price(tx_params.gas_price.unwrap_or(current_gas_price))
-                .gas_limit(tx_params.gas_limit.unwrap_or(BLOCK_GAS_LIMIT))
-                .nonce(tx_params.nonce.unwrap_or(1))
-                .build()
-                .unwrap();
-
-            // Execute transaction without writing to the DB
-            match evm.transact_finalize(tx_evm) {
-                Ok(result) => {
-                    println!("result: {:?}", result);
-                    result.result.gas_used() as u128
-                }
-                Err(e) => {
-                    println!("EVM execution error: {:?}", e);
-                    // Return a default gas cost for contract calls
-                    30_000
-                }
-            }
+            calculate_contract_creation_cost(tx_params.data.as_ref())
         } else {
             0
         };
