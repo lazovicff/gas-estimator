@@ -1,8 +1,24 @@
-use alloy::rlp::Bytes;
-use revm::primitives::{Address, U256};
+use revm::primitives::{Address, Bytes, U256};
+
+/// Calculate gas cost for calldata (transaction input data)
+pub fn calculate_calldata_cost(data: &Bytes) -> u128 {
+    let mut cost = 0;
+
+    for byte in data.iter() {
+        if *byte == 0 {
+            // Zero bytes cost 4 gas each
+            cost += 4;
+        } else {
+            // Non-zero bytes cost 16 gas each
+            cost += 16;
+        }
+    }
+
+    cost
+}
 
 /// Estimate storage operations cost
-fn estimate_storage_cost(data: &Bytes) -> U256 {
+pub fn estimate_storage_cost(data: &Bytes) -> U256 {
     let mut cost = U256::ZERO;
 
     // Simple heuristic: look for SSTORE-like patterns in bytecode
@@ -30,20 +46,20 @@ fn estimate_storage_cost(data: &Bytes) -> U256 {
 }
 
 /// Calculate contract creation cost
-fn calculate_contract_creation_cost(data: Option<&Bytes>) -> U256 {
+pub fn calculate_contract_creation_cost(data: Option<&Bytes>) -> u128 {
     if let Some(bytecode) = data {
         // Base cost for contract creation
-        let mut cost = U256::from(32_000);
+        let mut cost = 32_000;
         // Additional cost per byte of bytecode
-        cost += U256::from(bytecode.len() * 200);
+        cost += bytecode.len() as u128 * 200;
         cost
     } else {
-        U256::ZERO
+        0
     }
 }
 
 /// Estimate execution cost by analyzing opcodes
-fn estimate_execution_cost(data: &Bytes) -> U256 {
+pub fn estimate_execution_cost(data: &Bytes) -> U256 {
     let mut cost = U256::ZERO;
     let data_bytes = data.as_ref();
     let mut i = 0;
@@ -99,7 +115,7 @@ fn estimate_execution_cost(data: &Bytes) -> U256 {
 }
 
 /// Estimate precompile costs
-fn estimate_precompile_cost(data: &Bytes, to: Option<Address>) -> U256 {
+pub fn estimate_precompile_cost(data: &Bytes, to: Option<Address>) -> U256 {
     let mut cost = U256::ZERO;
     let data_bytes = data.as_ref();
 
@@ -140,7 +156,7 @@ fn estimate_precompile_cost(data: &Bytes, to: Option<Address>) -> U256 {
 }
 
 /// Estimate ModExp precompile cost
-fn estimate_modexp_cost(data: &[u8]) -> u64 {
+pub fn estimate_modexp_cost(data: &[u8]) -> u64 {
     if data.len() < 96 {
         return 200; // Minimum cost
     }
