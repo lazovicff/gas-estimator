@@ -4,10 +4,7 @@ use crate::utils::{
     calculate_access_list_cost, calculate_calldata_cost, calculate_contract_creation_cost,
     estimate_execution_cost, estimate_storage_cost,
 };
-use alloy::{
-    eips::BlockId,
-    providers::{Provider, ProviderBuilder},
-};
+use alloy::providers::{Provider, ProviderBuilder};
 use revm::primitives::Address;
 use serde::{Deserialize, Serialize};
 
@@ -147,8 +144,6 @@ impl GasEstimator {
 mod tests {
     use super::*;
     use alloy::primitives::{address, U64};
-    use alloy::signers::local::coins_bip39::English;
-    use alloy::signers::local::MnemonicBuilder;
     use alloy::sol;
     use alloy::sol_types::SolCall;
     use revm::primitives::{Bytes, U256};
@@ -196,25 +191,11 @@ mod tests {
     }
 
     // Test helper to create a contract deployment transaction
-    async fn create_contract_deployment_tx() -> (Tx, Address) {
-        // Deploy the contract bytecode using provider
-        let wallet = MnemonicBuilder::<English>::default()
-            .phrase(MNEMONIC)
-            .index(0)
-            .unwrap()
-            .build()
-            .unwrap();
-        let provider = ProviderBuilder::new()
-            .wallet(wallet.clone())
-            .connect(ETH_RPC_URL)
-            .await
-            .unwrap();
+    fn create_contract_deployment_tx() -> Tx {
         let bytecode = Bytes::from("60808060405234601957602a5f55610106908161001e8239f35b5f80fdfe608060405260043610156010575f80fd5b5f3560e01c80633fb5c1cb1460af5780638381f58a146094578063d09de08a14605e5763d5556544146040575f80fd5b34605a575f366003190112605a5760205f54604051908152f35b5f80fd5b34605a575f366003190112605a576001545f1981146080576001016001555f80f35b634e487b7160e01b5f52601160045260245ffd5b34605a575f366003190112605a576020600154604051908152f35b34605a576020366003190112605a575f54600435810180911160805760015500fea2646970667358221220e470db5efcff30a5d2bf2dfc5c01072c1364af37644d14ea4b2c86293086d86664736f6c634300081e0033");
-        let contract = Counter::deploy(&provider).await.unwrap();
-        let contract_address = contract.address();
 
         let tx = Tx {
-            from: Some(wallet.address()),
+            from: Some(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
             to: None, // Contract deployment
             value: U256::ZERO,
             data: Some(bytecode),
@@ -228,25 +209,18 @@ mod tests {
             transaction_type: Some(U64::from(0)),
         };
 
-        (tx, *contract_address)
+        tx
     }
 
     // Test helper to create a contract call transaction
-    fn create_contract_call_tx(contract_address: Address) -> Tx {
+    fn create_contract_call_tx() -> Tx {
         // ERC20 transfer function call: setNumber(uint256 number)
         // number: 1000000000000000000
         let call_data = setNumberCall::new((U256::from(1000000000000000000u64),));
 
-        let wallet = MnemonicBuilder::<English>::default()
-            .phrase(MNEMONIC)
-            .index(0)
-            .unwrap()
-            .build()
-            .unwrap();
-
         Tx {
-            from: Some(wallet.address()),
-            to: Some(contract_address),
+            from: Some(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
+            to: Some(address!("0x1234567890123456789012345678901234567890")),
             value: U256::ZERO,
             data: Some(Bytes::from(call_data.abi_encode())),
             nonce: Some(1),
@@ -277,7 +251,7 @@ mod tests {
     #[ignore = "code: -32003, message: transaction already imported"]
     async fn test_estimate_gas_contract_deployment() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let (tx, _contract_address) = create_contract_deployment_tx().await;
+        let tx = create_contract_deployment_tx();
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());
@@ -290,8 +264,7 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_gas_contract_call() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let (_, contract_address) = create_contract_deployment_tx().await;
-        let tx = create_contract_call_tx(contract_address);
+        let tx = create_contract_call_tx();
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());

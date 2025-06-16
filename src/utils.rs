@@ -118,7 +118,6 @@ pub fn estimate_execution_cost(data: &Bytes) -> u128 {
     let data_bytes = data.as_ref();
     let mut i = 0;
 
-    let mut current_registers = Vec::new();
     while i < data_bytes.len() {
         let opcode = data_bytes[i];
 
@@ -138,12 +137,6 @@ pub fn estimate_execution_cost(data: &Bytes) -> u128 {
             // Push operations
             0x60..=0x7f => {
                 let size = (opcode - 0x60 + 1) as usize;
-
-                let mut bytes = Vec::new();
-                for byte_i in i..(i + size) {
-                    bytes.push(data_bytes[byte_i]);
-                }
-                current_registers = bytes;
                 i += size; // Skip the pushed bytes
                 3
             }

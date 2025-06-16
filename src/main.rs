@@ -1,6 +1,7 @@
 mod error;
 mod estimators;
 mod rpc_server;
+mod tests;
 mod utils;
 
 use estimators::evm_based::GasEstimator;
