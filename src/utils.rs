@@ -1,5 +1,7 @@
-use revm::primitives::{Address, Bytes, U256};
+use revm::primitives::{Address, Bytes, FixedBytes, U256};
 use std::collections::HashSet;
+
+use crate::estimators::Tx;
 
 /// Calculate gas cost for calldata (transaction input data)
 pub fn calculate_calldata_cost(data: &Bytes) -> u128 {
@@ -19,9 +21,9 @@ pub fn calculate_calldata_cost(data: &Bytes) -> u128 {
 }
 
 /// Estimate storage operations cost with cold/warm slot tracking
-pub fn estimate_storage_cost(data: &Bytes) -> U256 {
-    let mut cost = U256::ZERO;
-    let mut warm_slots = HashSet::new();
+pub fn estimate_storage_cost(data: &Bytes, initial_warm_slots: HashSet<FixedBytes<32>>) -> u128 {
+    let mut cost = 0;
+    let mut warm_slots: HashSet<FixedBytes<32>> = initial_warm_slots;
     let data_bytes = data.as_ref();
     let mut i = 0;
 
@@ -34,15 +36,15 @@ pub fn estimate_storage_cost(data: &Bytes) -> U256 {
 
                 if warm_slots.contains(&slot) {
                     // Warm storage slot - cheaper write
-                    cost += U256::from(100); // WARM_STORAGE_READ_COST
+                    cost += 100; // WARM_STORAGE_READ_COST
                 } else {
                     // Cold storage slot - expensive first access
-                    cost += U256::from(2_100); // COLD_SLOAD_COST
+                    cost += 2_100; // COLD_SLOAD_COST
                     warm_slots.insert(slot);
 
                     // Additional cost for setting new storage (vs modifying existing)
                     // In practice, this would require checking if slot is zero
-                    cost += U256::from(20_000); // SSTORE_SET_COST (new storage)
+                    cost += 20_000; // SSTORE_SET_COST (new storage)
                 }
                 i += 1;
             }
@@ -51,9 +53,9 @@ pub fn estimate_storage_cost(data: &Bytes) -> U256 {
                 let slot = extract_storage_slot(data_bytes, i);
 
                 if warm_slots.contains(&slot) {
-                    cost += U256::from(100); // WARM_STORAGE_READ_COST
+                    cost += 100; // WARM_STORAGE_READ_COST
                 } else {
-                    cost += U256::from(2_100); // COLD_SLOAD_COST
+                    cost += 2_100; // COLD_SLOAD_COST
                     warm_slots.insert(slot);
                 }
                 i += 1;
@@ -66,26 +68,29 @@ pub fn estimate_storage_cost(data: &Bytes) -> U256 {
 }
 
 /// Extract storage slot from bytecode (simplified heuristic)
-fn extract_storage_slot(data: &[u8], sstore_pos: usize) -> u32 {
+fn extract_storage_slot(data: &[u8], sstore_pos: usize) -> FixedBytes<32> {
     // Look backwards for PUSH instructions to find the storage slot
     // This is a simplified approach - real implementation would need stack simulation
-    let mut slot = 0u32;
-    let start = if sstore_pos >= 10 { sstore_pos - 10 } else { 0 };
+    let mut slot = FixedBytes::<32>::ZERO;
+    let start = if sstore_pos >= 34 { sstore_pos - 34 } else { 0 };
 
     for i in start..sstore_pos {
         if data[i] >= 0x60 && data[i] <= 0x7f {
             // PUSH1 to PUSH32
             let push_size = (data[i] - 0x60 + 1) as usize;
             if i + push_size < sstore_pos {
-                // Extract the last 4 bytes as slot identifier
+                // Extract up to 32 bytes as slot identifier
                 let end = (i + push_size + 1).min(data.len());
                 if end > i + 1 {
-                    let bytes_to_take = (end - i - 1).min(4);
+                    let bytes_to_take = (end - i - 1).min(32);
+                    let mut slot_bytes = [0u8; 32];
+                    let start_offset = 32 - bytes_to_take;
                     for j in 0..bytes_to_take {
                         if i + 1 + j < data.len() {
-                            slot = (slot << 8) | data[i + 1 + j] as u32;
+                            slot_bytes[start_offset + j] = data[i + 1 + j];
                         }
                     }
+                    slot = FixedBytes::<32>::from_slice(&slot_bytes);
                 }
             }
         }
@@ -108,53 +113,60 @@ pub fn calculate_contract_creation_cost(data: Option<&Bytes>) -> u128 {
 }
 
 /// Estimate execution cost by analyzing opcodes
-pub fn estimate_execution_cost(data: &Bytes) -> U256 {
-    let mut cost = U256::ZERO;
+pub fn estimate_execution_cost(data: &Bytes) -> u128 {
+    let mut cost = 0;
     let data_bytes = data.as_ref();
     let mut i = 0;
 
+    let mut current_registers = Vec::new();
     while i < data_bytes.len() {
         let opcode = data_bytes[i];
 
         cost += match opcode {
             // Arithmetic operations
-            0x01..=0x0b => U256::from(3), // ADD, MUL, SUB, DIV, etc.
+            0x01..=0x0b => 3, // ADD, MUL, SUB, DIV, etc.
             // Comparison operations
-            0x10..=0x1d => U256::from(3), // LT, GT, SLT, SGT, EQ, etc.
+            0x10..=0x1d => 3, // LT, GT, SLT, SGT, EQ, etc.
             // SHA3
-            0x20 => U256::from(30),
+            0x20 => 30,
             // Environmental operations
-            0x30..=0x3f => U256::from(2), // ADDRESS, BALANCE, ORIGIN, etc.
+            0x30..=0x3f => 2, // ADDRESS, BALANCE, ORIGIN, etc.
             // Block operations
-            0x40..=0x48 => U256::from(20), // BLOCKHASH, COINBASE, etc.
+            0x40..=0x48 => 20, // BLOCKHASH, COINBASE, etc.
             // Stack operations
-            0x50..=0x5f => U256::from(3), // POP, MLOAD, MSTORE, etc.
+            0x50..=0x5f => 3, // POP, MLOAD, MSTORE, etc.
             // Push operations
             0x60..=0x7f => {
                 let size = (opcode - 0x60 + 1) as usize;
+
+                let mut bytes = Vec::new();
+                for byte_i in i..(i + size) {
+                    bytes.push(data_bytes[byte_i]);
+                }
+                current_registers = bytes;
                 i += size; // Skip the pushed bytes
-                U256::from(3)
+                3
             }
             // Duplication operations
-            0x80..=0x8f => U256::from(3),
+            0x80..=0x8f => 3,
             // Exchange operations
-            0x90..=0x9f => U256::from(3),
+            0x90..=0x9f => 3,
             // Logging operations
-            0xa0..=0xa4 => U256::from(375), // LOG0, LOG1, etc.
+            0xa0..=0xa4 => 375, // LOG0, LOG1, etc.
             // CALL-like operations
-            0xf1 => U256::from(700), // CALL
-            0xf2 => U256::from(700), // CALLCODE
-            0xf4 => U256::from(700), // DELEGATECALL
-            0xfa => U256::from(700), // STATICCALL
+            0xf1 => 700, // CALL
+            0xf2 => 700, // CALLCODE
+            0xf4 => 700, // DELEGATECALL
+            0xfa => 700, // STATICCALL
 
             // Other system operations
-            0xf0 => U256::from(32_000), // CREATE
-            0xf3 => U256::from(0),      // RETURN
-            0xf5 => U256::from(32_000), // CREATE2
-            0xfd => U256::from(0),      // REVERT
-            0xff => U256::from(5_000),  // SELFDESTRUCT
+            0xf0 => 32_000, // CREATE
+            0xf3 => 0,      // RETURN
+            0xf5 => 32_000, // CREATE2
+            0xfd => 0,      // REVERT
+            0xff => 5_000,  // SELFDESTRUCT
             // Default case
-            _ => U256::from(1),
+            _ => 1,
         };
 
         i += 1;
@@ -234,22 +246,27 @@ pub fn estimate_modexp_cost(data: &[u8]) -> u64 {
 }
 
 /// Calculate access list cost (EIP-2930)
-async fn calculate_access_list_cost(
-    &self,
-    tx_params: &Tx,
-    contract_bytecode: &Bytes,
-) -> Result<u128, Box<dyn std::error::Error>> {
+pub fn calculate_access_list_cost(tx_params: &Tx) -> (u128, HashSet<FixedBytes<32>>) {
     // Simple heuristic: estimate potential access list items
     let mut cost = 0;
+    let mut loaded_slots = HashSet::new();
 
-    if let Some(_) = tx_params.to {
-        // Check if target is a contract that might benefit from access list
-        if !contract_bytecode.is_empty() {
-            // Estimate potential storage slots accessed
-            cost += 2_400; // ADDRESS_ACCESS_COST
-            cost += 1_900 * 2; // STORAGE_KEY_ACCESS_COST for 2 slots
+    assert!(tx_params.access_list.is_some());
+    let access_list = tx_params.access_list.clone().unwrap();
+    let mut filtered_list = Vec::new();
+    for access_item in access_list.0 {
+        if access_item.address == tx_params.to.unwrap() {
+            filtered_list.push(access_item);
         }
     }
 
-    Ok(cost)
+    for access_item in filtered_list {
+        for storage_key in access_item.storage_keys {
+            cost += 2_100;
+            loaded_slots.insert(storage_key);
+        }
+    }
+    cost += 2400; // 1 address access cost;
+
+    (cost, loaded_slots)
 }

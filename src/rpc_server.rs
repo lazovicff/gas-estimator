@@ -1,4 +1,5 @@
-use crate::gas_estimator::{GasEstimate, GasEstimator, Tx};
+use crate::estimators::evm_based::{GasEstimate, GasEstimator};
+use crate::estimators::Tx;
 use jsonrpsee::{
     core::{async_trait, RpcResult},
     proc_macros::rpc,

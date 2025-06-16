@@ -1,4 +1,7 @@
-use crate::utils::{calculate_calldata_cost, calculate_contract_creation_cost};
+use crate::{
+    estimators::BLOCK_GAS_LIMIT,
+    utils::{calculate_calldata_cost, calculate_contract_creation_cost},
+};
 use alloy::{
     eips::BlockId,
     providers::{Provider, ProviderBuilder},
@@ -6,43 +9,13 @@ use alloy::{
 use revm::{
     context::{transaction::AccessList, tx::TxEnvBuilder},
     database::{CacheDB, EmptyDB},
-    primitives::{alloy_primitives::U64, keccak256, Address, Bytes, TxKind, U256},
+    primitives::{keccak256, Address, TxKind, U256},
     state::{AccountInfo, Bytecode},
     Context, ExecuteEvm, MainBuilder, MainContext,
 };
 use serde::{Deserialize, Serialize};
 
-const BLOCK_GAS_LIMIT: u64 = 30_000_000; // or 36,000,000
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tx {
-    // Standard transaction fields
-    pub from: Option<Address>,
-    pub to: Option<Address>,
-    pub value: U256,
-    #[serde(alias = "input")]
-    pub data: Option<Bytes>,
-    pub nonce: Option<u64>,
-    #[serde(alias = "chainId")]
-    pub chain_id: Option<U64>,
-
-    // Gas fields - using standard names
-    pub gas_limit: Option<u64>,
-    #[serde(alias = "gasPrice")]
-    pub gas_price: Option<u128>,
-    #[serde(alias = "maxFeePerGas")]
-    pub max_fee_per_gas: Option<u128>,
-    #[serde(alias = "maxPriorityFeePerGas")]
-    pub max_priority_fee_per_gas: Option<u128>,
-
-    // EIP-2930 Access List
-    #[serde(alias = "accessList")]
-    pub access_list: Option<AccessList>,
-
-    // Transaction type (0=Legacy, 1=EIP-2930, 2=EIP-1559)
-    #[serde(alias = "type")]
-    pub transaction_type: Option<U64>,
-}
+use super::Tx;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasEstimate {
@@ -260,11 +233,12 @@ impl GasEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{address, U64};
     use alloy::signers::local::coins_bip39::English;
     use alloy::signers::local::MnemonicBuilder;
     use alloy::sol;
     use alloy::sol_types::SolCall;
+    use revm::primitives::Bytes;
     use Counter::setNumberCall;
 
     const ETH_RPC_URL: &str = "http://localhost:8545";

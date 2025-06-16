@@ -1,9 +1,9 @@
 mod error;
-mod gas_estimator;
+mod estimators;
 mod rpc_server;
 mod utils;
 
-use gas_estimator::GasEstimator;
+use estimators::evm_based::GasEstimator;
 use rpc_server::RpcServer;
 use std::net::SocketAddr;
 use tokio::signal;
