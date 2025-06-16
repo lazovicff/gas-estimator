@@ -2,10 +2,11 @@
 pragma solidity ^0.8.13;
 
 contract Counter {
+    uint256 public offset = 42;
     uint256 public number;
 
     function setNumber(uint256 newNumber) public {
-        number = newNumber;
+        number = offset + newNumber;
     }
 
     function increment() public {
