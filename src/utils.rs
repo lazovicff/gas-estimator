@@ -1,4 +1,5 @@
 use revm::primitives::{Address, Bytes, U256};
+use std::collections::HashSet;
 
 /// Calculate gas cost for calldata (transaction input data)
 pub fn calculate_calldata_cost(data: &Bytes) -> u128 {
@@ -17,12 +18,10 @@ pub fn calculate_calldata_cost(data: &Bytes) -> u128 {
     cost
 }
 
-/// Estimate storage operations cost
+/// Estimate storage operations cost with cold/warm slot tracking
 pub fn estimate_storage_cost(data: &Bytes) -> U256 {
     let mut cost = U256::ZERO;
-
-    // Simple heuristic: look for SSTORE-like patterns in bytecode
-    // This is a simplified estimation
+    let mut warm_slots = HashSet::new();
     let data_bytes = data.as_ref();
     let mut i = 0;
 
@@ -30,12 +29,33 @@ pub fn estimate_storage_cost(data: &Bytes) -> U256 {
         match data_bytes[i] {
             0x55 => {
                 // SSTORE opcode - storage write
-                cost += U256::from(20_000); // Rough estimate for new storage
+                // Try to extract the storage slot from the previous PUSH operations
+                let slot = extract_storage_slot(data_bytes, i);
+
+                if warm_slots.contains(&slot) {
+                    // Warm storage slot - cheaper write
+                    cost += U256::from(100); // WARM_STORAGE_READ_COST
+                } else {
+                    // Cold storage slot - expensive first access
+                    cost += U256::from(2_100); // COLD_SLOAD_COST
+                    warm_slots.insert(slot);
+
+                    // Additional cost for setting new storage (vs modifying existing)
+                    // In practice, this would require checking if slot is zero
+                    cost += U256::from(20_000); // SSTORE_SET_COST (new storage)
+                }
                 i += 1;
             }
             0x54 => {
                 // SLOAD opcode - storage read
-                cost += U256::from(2_100);
+                let slot = extract_storage_slot(data_bytes, i);
+
+                if warm_slots.contains(&slot) {
+                    cost += U256::from(100); // WARM_STORAGE_READ_COST
+                } else {
+                    cost += U256::from(2_100); // COLD_SLOAD_COST
+                    warm_slots.insert(slot);
+                }
                 i += 1;
             }
             _ => i += 1,
@@ -43,6 +63,35 @@ pub fn estimate_storage_cost(data: &Bytes) -> U256 {
     }
 
     cost
+}
+
+/// Extract storage slot from bytecode (simplified heuristic)
+fn extract_storage_slot(data: &[u8], sstore_pos: usize) -> u32 {
+    // Look backwards for PUSH instructions to find the storage slot
+    // This is a simplified approach - real implementation would need stack simulation
+    let mut slot = 0u32;
+    let start = if sstore_pos >= 10 { sstore_pos - 10 } else { 0 };
+
+    for i in start..sstore_pos {
+        if data[i] >= 0x60 && data[i] <= 0x7f {
+            // PUSH1 to PUSH32
+            let push_size = (data[i] - 0x60 + 1) as usize;
+            if i + push_size < sstore_pos {
+                // Extract the last 4 bytes as slot identifier
+                let end = (i + push_size + 1).min(data.len());
+                if end > i + 1 {
+                    let bytes_to_take = (end - i - 1).min(4);
+                    for j in 0..bytes_to_take {
+                        if i + 1 + j < data.len() {
+                            slot = (slot << 8) | data[i + 1 + j] as u32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    slot
 }
 
 /// Calculate contract creation cost
