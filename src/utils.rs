@@ -232,3 +232,24 @@ pub fn estimate_modexp_cost(data: &[u8]) -> u64 {
 
     200 + complexity * exp_len / 20
 }
+
+/// Calculate access list cost (EIP-2930)
+async fn calculate_access_list_cost(
+    &self,
+    tx_params: &Tx,
+    contract_bytecode: &Bytes,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    // Simple heuristic: estimate potential access list items
+    let mut cost = 0;
+
+    if let Some(_) = tx_params.to {
+        // Check if target is a contract that might benefit from access list
+        if !contract_bytecode.is_empty() {
+            // Estimate potential storage slots accessed
+            cost += 2_400; // ADDRESS_ACCESS_COST
+            cost += 1_900 * 2; // STORAGE_KEY_ACCESS_COST for 2 slots
+        }
+    }
+
+    Ok(cost)
+}

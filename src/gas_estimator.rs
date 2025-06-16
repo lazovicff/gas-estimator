@@ -58,7 +58,6 @@ pub struct GasBreakdown {
     pub data_cost: u128,
     pub contract_creation_cost: u128,
     pub execution_cost: u128,
-    pub access_list_cost: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,10 +90,8 @@ impl GasEstimator {
         let breakdown = self.calculate_gas_breakdown(&tx_params).await?;
 
         // Sum up all gas costs
-        let estimated_gas = breakdown.base_cost
-            + breakdown.contract_creation_cost
-            + breakdown.execution_cost
-            + breakdown.access_list_cost;
+        let estimated_gas =
+            breakdown.base_cost + breakdown.contract_creation_cost + breakdown.execution_cost;
 
         // Get current gas price information
         let gas_price = provider.get_gas_price().await?;
@@ -179,6 +176,12 @@ impl GasEstimator {
                 .gas_price(tx_params.gas_price.unwrap_or(current_gas_price))
                 .gas_limit(tx_params.gas_limit.unwrap_or(BLOCK_GAS_LIMIT))
                 .nonce(tx_params.nonce.unwrap_or(1))
+                .access_list(
+                    tx_params
+                        .access_list
+                        .clone()
+                        .unwrap_or(AccessList::default()),
+                )
                 .build()
                 .unwrap();
 
@@ -213,15 +216,11 @@ impl GasEstimator {
             0
         };
 
-        // Calculate access list cost (EIP-2930)
-        let access_list_cost = self.calculate_access_list_cost(tx_params).await?;
-
         Ok(GasBreakdown {
             base_cost,
             data_cost,
             contract_creation_cost,
             execution_cost,
-            access_list_cost,
         })
     }
 
@@ -232,28 +231,6 @@ impl GasEstimator {
         let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
         let code = provider.get_code_at(to.unwrap()).await?;
         Ok(!code.is_empty())
-    }
-
-    /// Calculate access list cost (EIP-2930)
-    async fn calculate_access_list_cost(
-        &self,
-        tx_params: &Tx,
-    ) -> Result<u128, Box<dyn std::error::Error>> {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        // Simple heuristic: estimate potential access list items
-        let mut cost = 0;
-
-        if let Some(to) = tx_params.to {
-            // Check if target is a contract that might benefit from access list
-            let code = provider.get_code_at(to).await?;
-            if !code.is_empty() {
-                // Estimate potential storage slots accessed
-                cost += 2_400; // ADDRESS_ACCESS_COST
-                cost += 1_900 * 2; // STORAGE_KEY_ACCESS_COST for 2 slots
-            }
-        }
-
-        Ok(cost)
     }
 
     pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {
