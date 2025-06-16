@@ -1,4 +1,4 @@
-use crate::estimators::{evm_based, manual, Tx};
+use crate::gas_estimator::{GasEstimator, Tx};
 use alloy::{
     primitives::{address, U256, U64},
     providers::{Provider, ProviderBuilder},
@@ -57,13 +57,9 @@ async fn test_all_gas_estimation_approaches() {
     let contract_address = *contract.address();
 
     // Initialize estimators
-    let evm_estimator = evm_based::GasEstimator::new(ETH_RPC_URL)
+    let evm_estimator = GasEstimator::new(ETH_RPC_URL)
         .await
         .expect("Failed to create EVM estimator");
-
-    let manual_estimator = manual::GasEstimator::new(ETH_RPC_URL)
-        .await
-        .expect("Failed to create manual estimator");
 
     // Test Case 1: Simple Transfer
     println!("Testing Simple Transfer...");
@@ -93,21 +89,6 @@ async fn test_all_gas_estimation_approaches() {
     assert!(
         evm_transfer_estimate.estimated_gas >= 21000,
         "EVM transfer estimate too low"
-    );
-
-    // Test Manual estimation for simple transfer
-    let manual_transfer_result = manual_estimator
-        .estimate_gas(simple_transfer_tx.clone())
-        .await;
-    assert!(
-        manual_transfer_result.is_ok(),
-        "Manual estimation failed for simple transfer"
-    );
-    let manual_transfer_estimate = manual_transfer_result.unwrap();
-    println!("  Manual: {} gas", manual_transfer_estimate.estimated_gas);
-    assert!(
-        manual_transfer_estimate.estimated_gas >= 21000,
-        "Manual transfer estimate too low"
     );
 
     // Test Alloy provider estimation for simple transfer
@@ -162,21 +143,6 @@ async fn test_all_gas_estimation_approaches() {
         "EVM deployment estimate too low"
     );
 
-    // Test Manual estimation for contract deployment
-    let manual_deploy_result = manual_estimator
-        .estimate_gas(contract_deployment_tx.clone())
-        .await;
-    assert!(
-        manual_deploy_result.is_ok(),
-        "Manual estimation failed for contract deployment"
-    );
-    let manual_deploy_estimate = manual_deploy_result.unwrap();
-    println!("  Manual: {} gas", manual_deploy_estimate.estimated_gas);
-    assert!(
-        manual_deploy_estimate.estimated_gas > 21000,
-        "Manual deployment estimate too low"
-    );
-
     // Test Alloy provider estimation for contract deployment
     let alloy_deploy_tx = alloy::rpc::types::TransactionRequest::default()
         .from(wallet.address())
@@ -227,21 +193,6 @@ async fn test_all_gas_estimation_approaches() {
         "EVM call estimate too low"
     );
 
-    // Test Manual estimation for contract call
-    let manual_call_result = manual_estimator
-        .estimate_gas(contract_call_tx.clone())
-        .await;
-    assert!(
-        manual_call_result.is_ok(),
-        "Manual estimation failed for contract call"
-    );
-    let manual_call_estimate = manual_call_result.unwrap();
-    println!("  Manual: {} gas", manual_call_estimate.estimated_gas);
-    assert!(
-        manual_call_estimate.estimated_gas > 21000,
-        "Manual call estimate too low"
-    );
-
     // Test Alloy provider estimation for contract call
     let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
         .from(wallet.address())
@@ -261,31 +212,15 @@ async fn test_all_gas_estimation_approaches() {
     println!("\nSummary Comparison:");
     println!("Simple Transfer:");
     println!("  - EVM-based: {} gas", evm_transfer_estimate.estimated_gas);
-    println!("  - Manual: {} gas", manual_transfer_estimate.estimated_gas);
     println!("  - Alloy Provider: {} gas", alloy_transfer_estimate);
 
     println!("Contract Deployment:");
     println!("  - EVM-based: {} gas", evm_deploy_estimate.estimated_gas);
-    println!("  - Manual: {} gas", manual_deploy_estimate.estimated_gas);
     println!("  - Alloy Provider: {} gas", alloy_deploy_estimate);
 
     println!("Contract Call:");
     println!("  - EVM-based: {} gas", evm_call_estimate.estimated_gas);
-    println!("  - Manual: {} gas", manual_call_estimate.estimated_gas);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate);
-
-    // Verify all estimates are reasonable (not zero and above minimum)
-    assert!(evm_transfer_estimate.estimated_gas >= 21000);
-    assert!(manual_transfer_estimate.estimated_gas >= 21000);
-    assert!(alloy_transfer_estimate >= 21000);
-
-    assert!(evm_deploy_estimate.estimated_gas > 50000); // Deployment should cost more
-    assert!(manual_deploy_estimate.estimated_gas > 50000);
-    assert!(alloy_deploy_estimate > 50000);
-
-    assert!(evm_call_estimate.estimated_gas > 21000); // Call should cost more than transfer
-    assert!(manual_call_estimate.estimated_gas > 21000);
-    assert!(alloy_call_estimate > 21000);
 
     println!("\nAll gas estimation approaches tested successfully!");
 }

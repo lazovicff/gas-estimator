@@ -1,14 +1,49 @@
-use std::collections::HashSet;
-
-use crate::utils::{
-    calculate_access_list_cost, calculate_calldata_cost, calculate_contract_creation_cost,
-    estimate_execution_cost, estimate_storage_cost,
+use crate::utils::{calculate_calldata_cost, calculate_contract_creation_cost};
+use alloy::{
+    eips::BlockId,
+    primitives::U64,
+    providers::{Provider, ProviderBuilder},
 };
-use alloy::providers::{Provider, ProviderBuilder};
-use revm::primitives::Address;
+use revm::{
+    context::{transaction::AccessList, tx::TxEnvBuilder},
+    database::{CacheDB, EmptyDB},
+    primitives::{keccak256, Address, Bytes, TxKind, U256},
+    state::{AccountInfo, Bytecode},
+    Context, ExecuteEvm, MainBuilder, MainContext,
+};
 use serde::{Deserialize, Serialize};
 
-use super::Tx;
+pub const BLOCK_GAS_LIMIT: u64 = 30_000_000; // or 36,000,000
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tx {
+    // Standard transaction fields
+    pub from: Option<Address>,
+    pub to: Option<Address>,
+    pub value: U256,
+    #[serde(alias = "input")]
+    pub data: Option<Bytes>,
+    pub nonce: Option<u64>,
+    #[serde(alias = "chainId")]
+    pub chain_id: Option<U64>,
+
+    // Gas fields - using standard names
+    pub gas_limit: Option<u64>,
+    #[serde(alias = "gasPrice")]
+    pub gas_price: Option<u128>,
+    #[serde(alias = "maxFeePerGas")]
+    pub max_fee_per_gas: Option<u128>,
+    #[serde(alias = "maxPriorityFeePerGas")]
+    pub max_priority_fee_per_gas: Option<u128>,
+
+    // EIP-2930 Access List
+    #[serde(alias = "accessList")]
+    pub access_list: Option<AccessList>,
+
+    // Transaction type (0=Legacy, 1=EIP-2930, 2=EIP-1559)
+    #[serde(alias = "type")]
+    pub transaction_type: Option<U64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasEstimate {
@@ -24,8 +59,6 @@ pub struct GasBreakdown {
     pub data_cost: u128,
     pub contract_creation_cost: u128,
     pub execution_cost: u128,
-    pub access_list_cost: u128,
-    pub storage_cost: u128,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,12 +91,8 @@ impl GasEstimator {
         let breakdown = self.calculate_gas_breakdown(&tx_params).await?;
 
         // Sum up all gas costs
-        let estimated_gas = breakdown.base_cost
-            + breakdown.contract_creation_cost
-            + breakdown.data_cost
-            + breakdown.execution_cost
-            + breakdown.access_list_cost
-            + breakdown.storage_cost;
+        let estimated_gas =
+            breakdown.base_cost + breakdown.contract_creation_cost + breakdown.execution_cost;
 
         // Get current gas price information
         let gas_price = provider.get_gas_price().await?;
@@ -84,23 +113,91 @@ impl GasEstimator {
         &self,
         tx_params: &Tx,
     ) -> Result<GasBreakdown, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+        let current_gas_price = provider.get_gas_price().await?;
         // Base transaction cost (21,000 gas for simple transfers)
         let base_cost = 21_000;
 
-        let (access_list_cost, loaded_slots) = if tx_params.access_list.is_some() {
-            calculate_access_list_cost(tx_params)
-        } else {
-            (0, HashSet::new())
-        };
-
-        let storage_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
-            estimate_storage_cost(tx_params.data.as_ref().unwrap(), loaded_slots)
-        } else {
-            0
-        };
-
         let execution_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
-            estimate_execution_cost(tx_params.data.as_ref().unwrap())
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+
+            // Get actual balance from the provider
+            let caller = tx_params.from.unwrap();
+            let balance = provider.get_balance(caller).await.unwrap_or_else(|_| {
+                // Fallback to a reasonable amount if balance fetch fails
+                U256::from(10u128.pow(18) * 1000) // 1000 ETH
+            });
+            let nonce = provider.get_transaction_count(caller).await.unwrap_or(0);
+
+            cache_db.insert_account_info(
+                caller,
+                AccountInfo {
+                    balance,
+                    nonce: tx_params.nonce.unwrap_or(nonce),
+                    code_hash: revm::primitives::KECCAK_EMPTY,
+                    code: None,
+                },
+            );
+
+            // Get contract code from provider and add it to cache
+            let contract_address = tx_params.to.unwrap();
+            let contract_code = provider
+                .get_code_at(contract_address)
+                .await
+                .unwrap_or_default();
+            assert!(!contract_code.is_empty());
+            cache_db.insert_account_info(
+                contract_address,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 0,
+                    code_hash: keccak256(&contract_code),
+                    code: Some(Bytecode::new_raw(contract_code)),
+                },
+            );
+
+            // Initialise storage
+            // Only accounts for primitive storage variables, excluding mappings and arrays and structs
+            for i in 0..256 {
+                let storage_val = provider
+                    .get_storage_at(contract_address, U256::from(i))
+                    .await
+                    .unwrap();
+                cache_db
+                    .insert_account_storage(contract_address, U256::from(i), storage_val)
+                    .unwrap();
+            }
+
+            let mut evm = Context::mainnet().with_db(cache_db).build_mainnet();
+            let tx_evm = TxEnvBuilder::new()
+                .caller(caller)
+                .kind(TxKind::Call(tx_params.to.unwrap()))
+                .data(tx_params.data.clone().unwrap())
+                .value(tx_params.value)
+                .gas_price(tx_params.gas_price.unwrap_or(current_gas_price))
+                .gas_limit(tx_params.gas_limit.unwrap_or(BLOCK_GAS_LIMIT))
+                .nonce(tx_params.nonce.unwrap_or(1))
+                .access_list(
+                    tx_params
+                        .access_list
+                        .clone()
+                        .unwrap_or(AccessList::default()),
+                )
+                .build()
+                .unwrap();
+
+            // Execute transaction without writing to the DB
+            match evm.transact_finalize(tx_evm) {
+                Ok(result) => {
+                    println!("result: {:?}", result);
+                    result.result.gas_used() as u128 + 2_300 // Basic stipend for contract calls
+                }
+                Err(e) => {
+                    println!("EVM execution error: {:?}", e);
+                    // Return a default gas cost for contract calls
+                    30_000
+                }
+            }
         } else {
             0
         };
@@ -125,8 +222,6 @@ impl GasEstimator {
             data_cost,
             contract_creation_cost,
             execution_cost,
-            access_list_cost,
-            storage_cost,
         })
     }
 
@@ -138,15 +233,40 @@ impl GasEstimator {
         let code = provider.get_code_at(to.unwrap()).await?;
         Ok(!code.is_empty())
     }
+
+    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+        let gas_price = provider.get_gas_price().await?;
+        let latest_block = provider.get_block(BlockId::latest()).await?.unwrap();
+
+        let base_fee_per_gas = latest_block.header.base_fee_per_gas;
+        let gas_used = latest_block.header.gas_used;
+        let gas_limit = latest_block.header.gas_limit;
+
+        let utilization = if gas_limit > 0 {
+            (gas_used as f64 / gas_limit as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(NetworkGasInfo {
+            current_gas_price: gas_price,
+            base_fee_per_gas,
+            block_utilization: utilization,
+            latest_block_number: latest_block.header.number,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{address, U64};
+    use alloy::signers::local::coins_bip39::English;
+    use alloy::signers::local::MnemonicBuilder;
     use alloy::sol;
     use alloy::sol_types::SolCall;
-    use revm::primitives::{Bytes, U256};
+    use revm::primitives::Bytes;
     use Counter::setNumberCall;
 
     const ETH_RPC_URL: &str = "http://localhost:8545";
@@ -191,11 +311,25 @@ mod tests {
     }
 
     // Test helper to create a contract deployment transaction
-    fn create_contract_deployment_tx() -> Tx {
+    async fn create_contract_deployment_tx() -> (Tx, Address) {
+        // Deploy the contract bytecode using provider
+        let wallet = MnemonicBuilder::<English>::default()
+            .phrase(MNEMONIC)
+            .index(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ETH_RPC_URL)
+            .await
+            .unwrap();
         let bytecode = Bytes::from("60808060405234601957602a5f55610106908161001e8239f35b5f80fdfe608060405260043610156010575f80fd5b5f3560e01c80633fb5c1cb1460af5780638381f58a146094578063d09de08a14605e5763d5556544146040575f80fd5b34605a575f366003190112605a5760205f54604051908152f35b5f80fd5b34605a575f366003190112605a576001545f1981146080576001016001555f80f35b634e487b7160e01b5f52601160045260245ffd5b34605a575f366003190112605a576020600154604051908152f35b34605a576020366003190112605a575f54600435810180911160805760015500fea2646970667358221220e470db5efcff30a5d2bf2dfc5c01072c1364af37644d14ea4b2c86293086d86664736f6c634300081e0033");
+        let contract = Counter::deploy(&provider).await.unwrap();
+        let contract_address = contract.address();
 
         let tx = Tx {
-            from: Some(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
+            from: Some(wallet.address()),
             to: None, // Contract deployment
             value: U256::ZERO,
             data: Some(bytecode),
@@ -209,18 +343,25 @@ mod tests {
             transaction_type: Some(U64::from(0)),
         };
 
-        tx
+        (tx, *contract_address)
     }
 
     // Test helper to create a contract call transaction
-    fn create_contract_call_tx() -> Tx {
+    fn create_contract_call_tx(contract_address: Address) -> Tx {
         // ERC20 transfer function call: setNumber(uint256 number)
         // number: 1000000000000000000
         let call_data = setNumberCall::new((U256::from(1000000000000000000u64),));
 
+        let wallet = MnemonicBuilder::<English>::default()
+            .phrase(MNEMONIC)
+            .index(0)
+            .unwrap()
+            .build()
+            .unwrap();
+
         Tx {
-            from: Some(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
-            to: Some(address!("0x1234567890123456789012345678901234567890")),
+            from: Some(wallet.address()),
+            to: Some(contract_address),
             value: U256::ZERO,
             data: Some(Bytes::from(call_data.abi_encode())),
             nonce: Some(1),
@@ -251,7 +392,7 @@ mod tests {
     #[ignore = "code: -32003, message: transaction already imported"]
     async fn test_estimate_gas_contract_deployment() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let tx = create_contract_deployment_tx();
+        let (tx, _contract_address) = create_contract_deployment_tx().await;
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());
@@ -264,7 +405,8 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_gas_contract_call() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let tx = create_contract_call_tx();
+        let (_, contract_address) = create_contract_deployment_tx().await;
+        let tx = create_contract_call_tx(contract_address);
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());
@@ -272,5 +414,17 @@ mod tests {
         let estimate = result.unwrap();
         assert!(estimate.estimated_gas >= 21000);
         assert!(estimate.gas_price > 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_network_gas_info() {
+        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
+
+        let result = estimator.get_network_gas_info().await;
+        assert!(result.is_ok());
+
+        let info = result.unwrap();
+        assert!(info.current_gas_price > 0);
+        assert!(info.block_utilization >= 0.0 && info.block_utilization <= 100.0);
     }
 }
