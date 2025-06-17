@@ -1,6 +1,11 @@
 [profile.default]
 src = "contracts/src"
 out = "contracts/out"
+test = "contracts/test"
+cache_path = "contracts/cache"
 libs = ["contracts/lib"]
+fs_permissions = [{ access = "read-write", path = "./" }]
+solc = "0.8.27"
+via-ir = true
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
