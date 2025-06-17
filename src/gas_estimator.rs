@@ -158,6 +158,15 @@ impl GasEstimator {
         Ok(!code.is_empty())
     }
 
+    /// Check if an address is a precompile address
+    /// Ethereum precompiles are at addresses 0x01 through 0x09 (and potentially higher)
+    pub fn is_precompile(address: Address) -> bool {
+        let addr_u64 = address.as_slice()[19];
+        // Check if address is in the range 0x01 to 0x09 (standard Ethereum precompiles)
+        // Can be extended to include more precompiles as needed
+        addr_u64 >= 1 && addr_u64 <= 9
+    }
+
     pub async fn simulate_call(&self, tx_params: &Tx) -> Result<u128, Box<dyn std::error::Error>> {
         let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
         let current_gas_price = provider.get_gas_price().await?;
@@ -256,16 +265,18 @@ impl GasEstimator {
             .get_code_at(contract_address)
             .await
             .unwrap_or_default();
-        assert!(!contract_code.is_empty());
-        cache_db.insert_account_info(
-            contract_address,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 0,
-                code_hash: keccak256(&contract_code),
-                code: Some(Bytecode::new_raw(contract_code)),
-            },
-        );
+        if !Self::is_precompile(contract_address) {
+            assert!(!contract_code.is_empty());
+            cache_db.insert_account_info(
+                contract_address,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 0,
+                    code_hash: keccak256(&contract_code),
+                    code: Some(Bytecode::new_raw(contract_code)),
+                },
+            );
+        }
     }
 
     pub async fn populate_storage_slot(
@@ -317,34 +328,31 @@ mod tests {
     use alloy::sol;
     use alloy::sol_types::SolCall;
     use revm::primitives::Bytes;
-    use Counter::setNumberCall;
+    use Caller::{call_counterCall, precompileCall};
+    use Counter::{complexCall, setNumberCall};
 
     const ETH_RPC_URL: &str = "http://localhost:8545";
     const MNEMONIC: &str = "test test test test test test test test test test test junk";
 
-    sol! {
-        // SPDX-License-Identifier: MIT
-        pragma solidity ^0.8.20;
+    const COUNTER_BYTECODE: &str = "60808060405234601957602a5f556102a8908161001e8239f35b5f80fdfe60806040526004361015610011575f80fd5b5f3560e01c80633fb5c1cb1461020c5780638381f58a146101ef578063a49e0ab1146100655763d555654414610045575f80fd5b34610061575f3660031901126100615760205f54604051908152f35b5f80fd5b34610061575f366003190112610061576002545f6002558061018f575b505f5b600a81111561013b575f5b600a81111561009b57005b600181116100d657806100cc816100b46100d194610246565b90919082549060031b91821b915f19901b1916179055565b610238565b610090565b5f198101818111610127576100ea90610246565b90549060031b1c9060011981018181116101275761010790610246565b90549060031b1c8201809211610127576100cc6100d1926100b483610246565b634e487b7160e01b5f52601160045260245ffd5b600254906801000000000000000082101561017b576101638260016101769401600255610246565b8154905f199060031b1b19169055610238565b610085565b634e487b7160e01b5f52604160045260245ffd5b60025f527f405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace017f405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace5b8181106101e45750610082565b5f81556001016101d7565b34610061575f366003190112610061576020600154604051908152f35b34610061576020366003190112610061575f546004358082111561006157810390811161012757600155005b5f1981146101275760010190565b60025481101561025e5760025f5260205f2001905f90565b634e487b7160e01b5f52603260045260245ffdfea2646970667358221220ab2acc29b1df7998556b96668ce5211aeaeb96da04317a1c3def538659a7dffc64736f6c634300081e0033";
+    sol!(
+        #[allow(missing_docs)]
+        #[sol(rpc)]
+        Counter,
+        "./contracts/out/Counter.sol/Counter.json"
+    );
 
-        // solc contracts/src/Counter.sol --via-ir --optimize --bin
-        #[sol(rpc, bytecode="60808060405234601957602a5f55610106908161001e8239f35b5f80fdfe608060405260043610156010575f80fd5b5f3560e01c80633fb5c1cb1460af5780638381f58a146094578063d09de08a14605e5763d5556544146040575f80fd5b34605a575f366003190112605a5760205f54604051908152f35b5f80fd5b34605a575f366003190112605a576001545f1981146080576001016001555f80f35b634e487b7160e01b5f52601160045260245ffd5b34605a575f366003190112605a576020600154604051908152f35b34605a576020366003190112605a575f54600435810180911160805760015500fea2646970667358221220e470db5efcff30a5d2bf2dfc5c01072c1364af37644d14ea4b2c86293086d86664736f6c634300081e0033")]
-        contract Counter {
-            uint256 public offset = 42;
-            uint256 public number;
+    sol!(
+        #[allow(missing_docs)]
+        #[sol(rpc)]
+        Caller,
+        "./contracts/out/Caller.sol/Caller.json"
+    );
 
-            function setNumber(uint256 newNumber) public {
-                number = offset + newNumber;
-            }
-
-            function increment() public {
-                number++;
-            }
-        }
-    }
-
-    // Test helper to create a basic transaction
-    fn create_basic_tx() -> Tx {
-        Tx {
+    #[tokio::test]
+    async fn test_estimate_gas_simple_transfer() {
+        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
+        let tx = Tx {
             from: Some(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
             to: Some(address!("0x1234567890123456789012345678901234567890")),
             value: U256::from(1000000000000000000u64), // 1 ETH in wei
@@ -357,11 +365,20 @@ mod tests {
             max_priority_fee_per_gas: None,
             access_list: None,
             transaction_type: Some(U64::from(0)),
-        }
+        };
+
+        let result = estimator.estimate_gas(tx).await;
+        assert!(result.is_ok());
+
+        let estimate = result.unwrap();
+        assert!(estimate.estimated_gas >= 21000);
+        assert!(estimate.gas_price > 0);
     }
 
-    // Test helper to create a contract deployment transaction
-    async fn create_contract_deployment_tx() -> (Tx, Address) {
+    #[tokio::test]
+    #[ignore = "code: -32003, message: transaction already imported"]
+    async fn test_estimate_gas_contract_deployment() {
+        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
         // Deploy the contract bytecode using provider
         let wallet = MnemonicBuilder::<English>::default()
             .phrase(MNEMONIC)
@@ -374,9 +391,8 @@ mod tests {
             .connect(ETH_RPC_URL)
             .await
             .unwrap();
-        let bytecode = Bytes::from("60808060405234601957602a5f55610106908161001e8239f35b5f80fdfe608060405260043610156010575f80fd5b5f3560e01c80633fb5c1cb1460af5780638381f58a146094578063d09de08a14605e5763d5556544146040575f80fd5b34605a575f366003190112605a5760205f54604051908152f35b5f80fd5b34605a575f366003190112605a576001545f1981146080576001016001555f80f35b634e487b7160e01b5f52601160045260245ffd5b34605a575f366003190112605a576020600154604051908152f35b34605a576020366003190112605a575f54600435810180911160805760015500fea2646970667358221220e470db5efcff30a5d2bf2dfc5c01072c1364af37644d14ea4b2c86293086d86664736f6c634300081e0033");
-        let contract = Counter::deploy(&provider).await.unwrap();
-        let contract_address = contract.address();
+        let bytecode = Bytes::from(COUNTER_BYTECODE);
+        Counter::deploy(&provider).await.unwrap();
 
         let tx = Tx {
             from: Some(wallet.address()),
@@ -393,25 +409,36 @@ mod tests {
             transaction_type: Some(U64::from(0)),
         };
 
-        (tx, *contract_address)
+        let result = estimator.estimate_gas(tx).await;
+        assert!(result.is_ok());
+
+        let estimate = result.unwrap();
+        assert!(estimate.estimated_gas >= 21000);
+        assert!(estimate.gas_price > 0);
     }
 
-    // Test helper to create a contract call transaction
-    fn create_contract_call_tx(contract_address: Address) -> Tx {
-        // ERC20 transfer function call: setNumber(uint256 number)
-        // number: 1000000000000000000
-        let call_data = setNumberCall::new((U256::from(1000000000000000000u64),));
-
+    #[tokio::test]
+    async fn test_estimate_gas_contract_call_1() {
+        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
+        // Deploy the contract bytecode using provider
         let wallet = MnemonicBuilder::<English>::default()
             .phrase(MNEMONIC)
             .index(0)
             .unwrap()
             .build()
             .unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ETH_RPC_URL)
+            .await
+            .unwrap();
+        let contract = Counter::deploy(&provider).await.unwrap();
+        let contract_address = contract.address();
+        let call_data = setNumberCall::new((U256::from(20),));
 
-        Tx {
+        let tx = Tx {
             from: Some(wallet.address()),
-            to: Some(contract_address),
+            to: Some(*contract_address),
             value: U256::ZERO,
             data: Some(Bytes::from(call_data.abi_encode())),
             nonce: Some(1),
@@ -422,13 +449,7 @@ mod tests {
             max_priority_fee_per_gas: Some(2000000000),
             access_list: None,
             transaction_type: Some(U64::from(2)), // EIP-1559
-        }
-    }
-
-    #[tokio::test]
-    async fn test_estimate_gas_simple_transfer() {
-        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let tx = create_basic_tx();
+        };
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());
@@ -439,10 +460,39 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "code: -32003, message: transaction already imported"]
-    async fn test_estimate_gas_contract_deployment() {
+    async fn test_estimate_gas_contract_call_2() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let (tx, _contract_address) = create_contract_deployment_tx().await;
+        // Deploy the contract bytecode using provider
+        let wallet = MnemonicBuilder::<English>::default()
+            .phrase(MNEMONIC)
+            .index(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ETH_RPC_URL)
+            .await
+            .unwrap();
+        let contract = Counter::deploy(&provider).await.unwrap();
+        let contract_address = contract.address();
+
+        let call_data = complexCall::new(());
+
+        let tx = Tx {
+            from: Some(wallet.address()),
+            to: Some(*contract_address),
+            value: U256::ZERO,
+            data: Some(Bytes::from(call_data.abi_encode())),
+            nonce: Some(1),
+            chain_id: Some(U64::from(1)),
+            gas_limit: None,
+            gas_price: Some(20000000000),
+            max_fee_per_gas: Some(30000000000),
+            max_priority_fee_per_gas: Some(2000000000),
+            access_list: None,
+            transaction_type: Some(U64::from(2)), // EIP-1559
+        };
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());
@@ -453,10 +503,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_estimate_gas_contract_call() {
+    async fn test_estimate_gas_contract_call_3() {
         let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
-        let (_, contract_address) = create_contract_deployment_tx().await;
-        let tx = create_contract_call_tx(contract_address);
+        // Deploy the contract bytecode using provider
+        let wallet = MnemonicBuilder::<English>::default()
+            .phrase(MNEMONIC)
+            .index(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ETH_RPC_URL)
+            .await
+            .unwrap();
+        let contract = Caller::deploy(&provider).await.unwrap();
+        let contract_address = contract.address();
+        // calling precompile function
+        let call_data = precompileCall::new((U256::from(123456),));
+
+        let tx = Tx {
+            from: Some(wallet.address()),
+            to: Some(*contract_address),
+            value: U256::ZERO,
+            data: Some(Bytes::from(call_data.abi_encode())),
+            nonce: Some(1),
+            chain_id: Some(U64::from(1)),
+            gas_limit: None,
+            gas_price: Some(20000000000),
+            max_fee_per_gas: Some(30000000000),
+            max_priority_fee_per_gas: Some(2000000000),
+            access_list: None,
+            transaction_type: Some(U64::from(2)), // EIP-1559
+        };
+
+        let result = estimator.estimate_gas(tx).await;
+        assert!(result.is_ok());
+
+        let estimate = result.unwrap();
+        assert!(estimate.estimated_gas >= 21000);
+        assert!(estimate.gas_price > 0);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_gas_contract_call_4() {
+        let estimator = GasEstimator::new(&ETH_RPC_URL).await.unwrap();
+        // Deploy the contract bytecode using provider
+        let wallet = MnemonicBuilder::<English>::default()
+            .phrase(MNEMONIC)
+            .index(0)
+            .unwrap()
+            .build()
+            .unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ETH_RPC_URL)
+            .await
+            .unwrap();
+        let contract = Caller::deploy(&provider).await.unwrap();
+        let contract_address = contract.address();
+
+        let counter_contract = Counter::deploy(&provider).await.unwrap();
+        let counter_contract_address = counter_contract.address();
+
+        // calling precompile function
+        let call_data = call_counterCall::new((*counter_contract_address,));
+
+        let tx = Tx {
+            from: Some(wallet.address()),
+            to: Some(*contract_address),
+            value: U256::ZERO,
+            data: Some(Bytes::from(call_data.abi_encode())),
+            nonce: Some(1),
+            chain_id: Some(U64::from(1)),
+            gas_limit: None,
+            gas_price: Some(20000000000),
+            max_fee_per_gas: Some(30000000000),
+            max_priority_fee_per_gas: Some(2000000000),
+            access_list: None,
+            transaction_type: Some(U64::from(2)), // EIP-1559
+        };
 
         let result = estimator.estimate_gas(tx).await;
         assert!(result.is_ok());

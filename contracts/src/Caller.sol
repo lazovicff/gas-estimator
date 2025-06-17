@@ -13,6 +13,8 @@ contract Caller {
     }
 
     function call_counter(address counterAddress) public {
-        Counter(counterAddress).setNumber(20);
+        bytes memory payload = abi.encodeWithSignature("setNumber(uint256)", 20);
+        (bool success,) = address(counterAddress).call(payload);
+        require(success);
     }
 }

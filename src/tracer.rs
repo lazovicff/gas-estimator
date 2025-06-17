@@ -1,7 +1,9 @@
+use revm::bytecode::opcode;
 use revm::context::ContextTr;
 use revm::inspector::JournalExt;
 use revm::interpreter::interpreter_types::Jumps;
 use revm::interpreter::{CallInputs, CallOutcome, Interpreter};
+use revm::primitives::B256;
 use revm::{
     inspector::Inspector,
     primitives::{Address, U256},
@@ -56,7 +58,7 @@ where
     CTX: ContextTr<Journal: JournalExt>,
 {
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        if self
+        if !self
             .contract_addresses_archive
             .contains(&inputs.target_address)
         {
@@ -72,24 +74,23 @@ where
 
     fn step(&mut self, interpreter: &mut Interpreter, _context: &mut CTX) {
         // Get the current opcode from the bytecode
-        if let Some(opcode) = interpreter
-            .bytecode
-            .bytecode()
-            .get(interpreter.bytecode.pc())
-        {
-            match *opcode {
-                // SLOAD - Load from storage (opcode 0x54)
-                0x54 => {
-                    if let Ok(slot) = interpreter.stack.peek(0) {
-                        if let Some(address) = self.current_address {
-                            if !self.storage_access_archive.contains_key(&address) {
-                                self.storage_accesses.insert(address, slot);
-                            }
+        match interpreter.bytecode.opcode() {
+            // SLOAD - Load from storage (opcode 0x54)
+            opcode::SLOAD => {
+                if let Ok(slot) = interpreter.stack.peek(0) {
+                    if let Some(address) = self.current_address {
+                        if !self.storage_access_archive.contains_key(&address) {
+                            self.storage_accesses.insert(address, slot);
                         }
                     }
                 }
-                _ => {}
             }
+            opcode::DELEGATECALL | opcode::CALL | opcode::STATICCALL | opcode::CALLCODE => {
+                let slot = interpreter.stack.peek(1).unwrap();
+                let addr = Address::from_word(B256::from(slot.to_be_bytes()));
+                println!("Calling address: {:?}", addr);
+            }
+            _ => {}
         }
     }
 }
