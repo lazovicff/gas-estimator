@@ -5,52 +5,43 @@ use revm::interpreter::{CallInputs, CallOutcome, Interpreter};
 use revm::{
     inspector::Inspector,
     primitives::{Address, U256},
-    Database,
 };
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
-pub struct StorageAccess {
-    pub address: Address,
-    pub slot: U256,
-}
-
-#[derive(Debug, Clone)]
 pub struct Tracer {
-    contract_addresses: HashSet<Address>,
-    storage_accesses: Vec<StorageAccess>,
+    pub contract_addresses: HashSet<Address>,
+    pub storage_accesses: HashMap<Address, U256>,
     current_address: Option<Address>,
+    // Keep track of historical accesses
+    storage_access_archive: HashMap<Address, U256>,
+    contract_addresses_archive: HashSet<Address>,
 }
 
 impl Tracer {
     pub fn new() -> Self {
         Self {
             contract_addresses: HashSet::new(),
-            storage_accesses: Vec::new(),
+            storage_accesses: HashMap::new(),
             current_address: None,
+
+            storage_access_archive: HashMap::new(),
+            contract_addresses_archive: HashSet::new(),
         }
     }
 
-    pub fn get_contract_addresses(&self) -> &HashSet<Address> {
-        &self.contract_addresses
+    pub fn has_new_accesses(&self) -> bool {
+        self.contract_addresses.len() > 0 || self.storage_accesses.len() > 0
     }
 
-    pub fn get_storage_accesses(&self) -> &[StorageAccess] {
-        &self.storage_accesses
-    }
+    pub fn reset_state(&mut self) {
+        self.storage_access_archive
+            .extend(self.storage_accesses.iter());
+        self.contract_addresses_archive
+            .extend(self.contract_addresses.iter());
 
-    pub fn get_unique_slots(&self) -> HashSet<(Address, U256)> {
-        self.storage_accesses
-            .iter()
-            .map(|access| (access.address, access.slot))
-            .collect()
-    }
-
-    pub fn record_storage_access(&mut self, slot: U256) {
-        if let Some(address) = self.current_address {
-            let access = StorageAccess { address, slot };
-            self.storage_accesses.push(access);
-        }
+        self.storage_accesses.clear();
+        self.contract_addresses.clear();
     }
 }
 
@@ -65,7 +56,12 @@ where
     CTX: ContextTr<Journal: JournalExt>,
 {
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        self.contract_addresses.insert(inputs.target_address);
+        if self
+            .contract_addresses_archive
+            .contains(&inputs.target_address)
+        {
+            self.contract_addresses.insert(inputs.target_address);
+        }
         self.current_address = Some(inputs.target_address);
         None
     }
@@ -85,7 +81,11 @@ where
                 // SLOAD - Load from storage (opcode 0x54)
                 0x54 => {
                     if let Ok(slot) = interpreter.stack.peek(0) {
-                        self.record_storage_access(slot);
+                        if let Some(address) = self.current_address {
+                            if !self.storage_access_archive.contains_key(&address) {
+                                self.storage_accesses.insert(address, slot);
+                            }
+                        }
                     }
                 }
                 _ => {}
