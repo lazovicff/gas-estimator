@@ -1,12 +1,16 @@
-use crate::utils::{calculate_calldata_cost, calculate_contract_creation_cost};
+use crate::{
+    tracer::Tracer,
+    utils::{calculate_calldata_cost, calculate_contract_creation_cost},
+};
 use alloy::{
     eips::BlockId,
     primitives::U64,
     providers::{Provider, ProviderBuilder},
 };
 use revm::{
-    context::{transaction::AccessList, tx::TxEnvBuilder},
+    context::{transaction::AccessList, tx::TxEnvBuilder, ContextTr},
     database::{CacheDB, EmptyDB},
+    inspector::InspectEvm,
     primitives::{keccak256, Address, Bytes, TxKind, U256},
     state::{AccountInfo, Bytecode},
     Context, ExecuteEvm, MainBuilder, MainContext,
@@ -113,91 +117,11 @@ impl GasEstimator {
         &self,
         tx_params: &Tx,
     ) -> Result<GasBreakdown, Box<dyn std::error::Error>> {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let current_gas_price = provider.get_gas_price().await?;
         // Base transaction cost (21,000 gas for simple transfers)
         let base_cost = 21_000;
 
         let execution_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
-            let mut cache_db = CacheDB::new(EmptyDB::default());
-
-            // Get actual balance from the provider
-            let caller = tx_params.from.unwrap();
-            let balance = provider.get_balance(caller).await.unwrap_or_else(|_| {
-                // Fallback to a reasonable amount if balance fetch fails
-                U256::from(10u128.pow(18) * 1000) // 1000 ETH
-            });
-            let nonce = provider.get_transaction_count(caller).await.unwrap_or(0);
-
-            cache_db.insert_account_info(
-                caller,
-                AccountInfo {
-                    balance,
-                    nonce: tx_params.nonce.unwrap_or(nonce),
-                    code_hash: revm::primitives::KECCAK_EMPTY,
-                    code: None,
-                },
-            );
-
-            // Get contract code from provider and add it to cache
-            let contract_address = tx_params.to.unwrap();
-            let contract_code = provider
-                .get_code_at(contract_address)
-                .await
-                .unwrap_or_default();
-            assert!(!contract_code.is_empty());
-            cache_db.insert_account_info(
-                contract_address,
-                AccountInfo {
-                    balance: U256::ZERO,
-                    nonce: 0,
-                    code_hash: keccak256(&contract_code),
-                    code: Some(Bytecode::new_raw(contract_code)),
-                },
-            );
-
-            // Initialise storage
-            // Only accounts for primitive storage variables, excluding mappings and arrays and structs
-            for i in 0..256 {
-                let storage_val = provider
-                    .get_storage_at(contract_address, U256::from(i))
-                    .await
-                    .unwrap();
-                cache_db
-                    .insert_account_storage(contract_address, U256::from(i), storage_val)
-                    .unwrap();
-            }
-
-            let mut evm = Context::mainnet().with_db(cache_db).build_mainnet();
-            let tx_evm = TxEnvBuilder::new()
-                .caller(caller)
-                .kind(TxKind::Call(tx_params.to.unwrap()))
-                .data(tx_params.data.clone().unwrap())
-                .value(tx_params.value)
-                .gas_price(tx_params.gas_price.unwrap_or(current_gas_price))
-                .gas_limit(tx_params.gas_limit.unwrap_or(BLOCK_GAS_LIMIT))
-                .nonce(tx_params.nonce.unwrap_or(1))
-                .access_list(
-                    tx_params
-                        .access_list
-                        .clone()
-                        .unwrap_or(AccessList::default()),
-                )
-                .build()
-                .unwrap();
-
-            // Execute transaction without writing to the DB
-            match evm.transact_finalize(tx_evm) {
-                Ok(result) => {
-                    println!("result: {:?}", result);
-                    result.result.gas_used() as u128 + 2_300 // Basic stipend for contract calls
-                }
-                Err(e) => {
-                    println!("EVM execution error: {:?}", e);
-                    // Return a default gas cost for contract calls
-                    30_000
-                }
-            }
+            self.simulate_call(&tx_params).await?
         } else {
             0
         };
@@ -232,6 +156,98 @@ impl GasEstimator {
         let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
         let code = provider.get_code_at(to.unwrap()).await?;
         Ok(!code.is_empty())
+    }
+
+    pub async fn simulate_call(&self, tx_params: &Tx) -> Result<u128, Box<dyn std::error::Error>> {
+        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
+        let current_gas_price = provider.get_gas_price().await?;
+        let mut tracer = Tracer::new();
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+
+        // Get actual balance from the provider
+        let caller = tx_params.from.unwrap();
+        let balance = provider.get_balance(caller).await.unwrap_or_else(|_| {
+            // Fallback to a reasonable amount if balance fetch fails
+            U256::from(10u128.pow(18) * 1000) // 1000 ETH
+        });
+        let nonce = provider.get_transaction_count(caller).await.unwrap_or(0);
+
+        cache_db.insert_account_info(
+            caller,
+            AccountInfo {
+                balance,
+                nonce: tx_params.nonce.unwrap_or(nonce),
+                code_hash: revm::primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+
+        // Get contract code from provider and add it to cache
+        let contract_address = tx_params.to.unwrap();
+        let contract_code = provider
+            .get_code_at(contract_address)
+            .await
+            .unwrap_or_default();
+        assert!(!contract_code.is_empty());
+        cache_db.insert_account_info(
+            contract_address,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: keccak256(&contract_code),
+                code: Some(Bytecode::new_raw(contract_code)),
+            },
+        );
+
+        // Initialise storage
+        // Only accounts for primitive storage variables, excluding mappings and arrays and structs
+        for i in 0..256 {
+            let storage_val = provider
+                .get_storage_at(contract_address, U256::from(i))
+                .await
+                .unwrap();
+            cache_db
+                .insert_account_storage(contract_address, U256::from(i), storage_val)
+                .unwrap();
+        }
+
+        let mut evm = Context::mainnet()
+            .with_db(cache_db)
+            .build_mainnet_with_inspector(&mut tracer);
+        let tx_evm = TxEnvBuilder::new()
+            .caller(caller)
+            .kind(TxKind::Call(tx_params.to.unwrap()))
+            .data(tx_params.data.clone().unwrap())
+            .value(tx_params.value)
+            .gas_price(tx_params.gas_price.unwrap_or(current_gas_price))
+            .gas_limit(tx_params.gas_limit.unwrap_or(BLOCK_GAS_LIMIT))
+            .nonce(tx_params.nonce.unwrap_or(1))
+            .access_list(
+                tx_params
+                    .access_list
+                    .clone()
+                    .unwrap_or(AccessList::default()),
+            )
+            .build()
+            .unwrap();
+
+        // Execute transaction without writing to the DB
+        match evm.inspect_tx(tx_evm) {
+            Ok(result) => {
+                println!("result: {:?}", result);
+
+                let tracer_after_call = evm.inspector;
+                println!("tracer: {:?}", tracer_after_call);
+
+                Ok(result.gas_used() as u128 + 2_300) // Basic stipend for contract calls
+            }
+            Err(e) => {
+                println!("EVM execution error: {:?}", e);
+                // Return a default gas cost for contract calls
+                Ok(30_000)
+            }
+        }
     }
 
     pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {

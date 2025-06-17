@@ -2,6 +2,7 @@ mod error;
 mod gas_estimator;
 mod rpc_server;
 mod tests;
+mod tracer;
 mod utils;
 
 use gas_estimator::GasEstimator;
