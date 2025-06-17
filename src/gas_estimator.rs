@@ -214,7 +214,7 @@ impl GasEstimator {
                     let tracer_after_call = evm.inspector.clone();
                     println!("tracer: {:?}", tracer_after_call);
 
-                    result.gas_used() as u128 + 2_300
+                    result.gas_used() as u128
                 }
                 Err(e) => {
                     println!("EVM execution error: {:?}", e);
