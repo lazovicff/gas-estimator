@@ -115,7 +115,16 @@ impl GasEstimator {
     /// Calculate detailed gas breakdown using specialized estimators
     async fn calculate_gas_breakdown(&self, tx_params: &Tx) -> Result<GasBreakdown, Error> {
         // Base transaction cost
-        let base_cost = 21_000;
+        let base_cost = if let Some(chain_id) = tx_params.chain_id {
+            // Anvil has 0 base cost if calling a contract
+            if chain_id == U64::from(31337) && self.is_contract(tx_params.to).await? {
+                0
+            } else {
+                21000
+            }
+        } else {
+            21000
+        };
 
         let execution_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
             self.simulate_call(&tx_params).await?

@@ -29,6 +29,13 @@ sol!(
     "./contracts/out/Caller.sol/Caller.json"
 );
 
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    ERC20,
+    "./contracts/out/ERC20.sol/ERC20.json"
+);
+
 async fn setup_test_server() -> (RpcServer, String) {
     let bind_addr = "127.0.0.1:0".parse().unwrap();
 
@@ -204,7 +211,7 @@ async fn test_all_gas_estimation_approaches() {
         value: U256::ZERO,
         data: Some(encoded_call_data.clone()),
         nonce: Some(1),
-        chain_id: Some(U64::from(1)),
+        chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
         max_fee_per_gas: Some(30000000000),
@@ -237,7 +244,7 @@ async fn test_all_gas_estimation_approaches() {
         value: U256::ZERO,
         data: Some(encoded_call_data.clone()),
         nonce: Some(1),
-        chain_id: Some(U64::from(1)),
+        chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
         max_fee_per_gas: Some(30000000000),
@@ -270,7 +277,7 @@ async fn test_all_gas_estimation_approaches() {
         value: U256::ZERO,
         data: Some(encoded_call_data.clone()),
         nonce: Some(1),
-        chain_id: Some(U64::from(1)),
+        chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
         max_fee_per_gas: Some(30000000000),
