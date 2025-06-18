@@ -1,4 +1,4 @@
-use crate::gas_estimator::{GasEstimator, Tx};
+use crate::{gas_estimator::Tx, rpc_server::RpcServer};
 use alloy::{
     primitives::{address, U256, U64},
     providers::{Provider, ProviderBuilder},
@@ -6,8 +6,11 @@ use alloy::{
     sol,
     sol_types::SolCall,
 };
+use reqwest::Client;
 use revm::primitives::Bytes;
-use std::str::FromStr;
+use serde_json::{json, Value};
+use std::{str::FromStr, time::Duration};
+use tokio::time::sleep;
 
 const ETH_RPC_URL: &str = "http://localhost:8545";
 const MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -26,9 +29,54 @@ sol!(
     "./contracts/out/Caller.sol/Caller.json"
 );
 
+async fn setup_test_server() -> (RpcServer, String) {
+    let bind_addr = "127.0.0.1:0".parse().unwrap();
+
+    let server = RpcServer::new(bind_addr, ETH_RPC_URL.to_string())
+        .await
+        .unwrap();
+    let server_url = format!("http://{}", server.local_addr());
+
+    // Give server a moment to fully start
+    sleep(Duration::from_millis(100)).await;
+
+    (server, server_url)
+}
+
+async fn estimate_gas_via_rpc(server_url: &str, tx: Tx) -> Result<u64, Box<dyn std::error::Error>> {
+    let client = Client::new();
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "method": "estimate_gas",
+        "params": [{
+            "transaction": tx,
+            "rpc_url": null
+        }],
+        "id": 1
+    });
+
+    let response = client.post(server_url).json(&request_body).send().await?;
+
+    let response_body: Value = response.json().await?;
+
+    if !response_body["error"].is_null() {
+        return Err(format!("RPC error: {}", response_body["error"]).into());
+    }
+
+    let estimated_gas = response_body["result"]["estimate"]["estimated_gas"]
+        .as_u64()
+        .ok_or("Failed to parse estimated_gas")?;
+
+    Ok(estimated_gas)
+}
+
 #[tokio::test]
 async fn test_all_gas_estimation_approaches() {
     println!("\n=== Testing All Gas Estimation Approaches ===\n");
+
+    // Setup RPC server for EVM-based estimation
+    let (_server, server_url) = setup_test_server().await;
 
     // Setup wallet and provider for contract operations
     let wallet = MnemonicBuilder::<English>::default()
@@ -51,9 +99,6 @@ async fn test_all_gas_estimation_approaches() {
     let contract = Caller::deploy(&provider).await.unwrap();
     let caller_contract_address = *contract.address();
 
-    // Initialize estimators
-    let evm_estimator = GasEstimator::new(ETH_RPC_URL).await.unwrap();
-
     // Test Case 1: Simple Transfer
     let simple_transfer_tx = Tx {
         from: Some(wallet.address()),
@@ -70,9 +115,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(0)),
     };
 
-    // Test EVM-based estimation for simple transfer
-    let evm_transfer_result = evm_estimator.estimate_gas(simple_transfer_tx.clone()).await;
-    let evm_transfer_estimate = evm_transfer_result.unwrap();
+    // Test EVM-based estimation for simple transfer via RPC
+    let evm_transfer_estimate = estimate_gas_via_rpc(&server_url, simple_transfer_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for simple transfer
     let alloy_transfer_tx = alloy::rpc::types::TransactionRequest::default()
@@ -101,11 +147,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(0)),
     };
 
-    // Test EVM-based estimation for contract deployment
-    let evm_deploy_result = evm_estimator
-        .estimate_gas(contract_deployment_tx.clone())
-        .await;
-    let evm_deploy_estimate = evm_deploy_result.unwrap();
+    // Test EVM-based estimation for contract deployment via RPC
+    let evm_deploy_estimate = estimate_gas_via_rpc(&server_url, contract_deployment_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for contract deployment
     let alloy_deploy_tx = alloy::rpc::types::TransactionRequest::default()
@@ -135,9 +180,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
 
-    // Test EVM-based estimation for contract call
-    let evm_call_result = evm_estimator.estimate_gas(contract_call_tx.clone()).await;
-    let evm_call_estimate_1 = evm_call_result.unwrap();
+    // Test EVM-based estimation for contract call via RPC
+    let evm_call_estimate_1 = estimate_gas_via_rpc(&server_url, contract_call_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for contract call
     let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
@@ -167,9 +213,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
 
-    // Test EVM-based estimation for contract call
-    let evm_call_result = evm_estimator.estimate_gas(contract_call_tx.clone()).await;
-    let evm_call_estimate_2 = evm_call_result.unwrap();
+    // Test EVM-based estimation for contract call via RPC
+    let evm_call_estimate_2 = estimate_gas_via_rpc(&server_url, contract_call_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for contract call
     let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
@@ -199,9 +246,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
 
-    // Test EVM-based estimation for contract call
-    let evm_call_result = evm_estimator.estimate_gas(contract_call_tx.clone()).await;
-    let evm_call_estimate_3 = evm_call_result.unwrap();
+    // Test EVM-based estimation for contract call via RPC
+    let evm_call_estimate_3 = estimate_gas_via_rpc(&server_url, contract_call_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for contract call
     let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
@@ -231,9 +279,10 @@ async fn test_all_gas_estimation_approaches() {
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
 
-    // Test EVM-based estimation for contract call
-    let evm_call_result = evm_estimator.estimate_gas(contract_call_tx.clone()).await;
-    let evm_call_estimate_4 = evm_call_result.unwrap();
+    // Test EVM-based estimation for contract call via RPC
+    let evm_call_estimate_4 = estimate_gas_via_rpc(&server_url, contract_call_tx.clone())
+        .await
+        .unwrap();
 
     // Test Alloy provider estimation for contract call
     let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
@@ -247,27 +296,27 @@ async fn test_all_gas_estimation_approaches() {
     // Summary and comparison
     println!("\nSummary Comparison:");
     println!("Simple Transfer:");
-    println!("  - EVM-based: {} gas", evm_transfer_estimate.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_transfer_estimate);
     println!("  - Alloy Provider: {} gas", alloy_transfer_estimate);
 
     println!("Contract Deployment:");
-    println!("  - EVM-based: {} gas", evm_deploy_estimate.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_deploy_estimate);
     println!("  - Alloy Provider: {} gas", alloy_deploy_estimate);
 
     println!("Contract Call 1:");
-    println!("  - EVM-based: {} gas", evm_call_estimate_1.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_1);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate_1);
 
     println!("Contract Call 2:");
-    println!("  - EVM-based: {} gas", evm_call_estimate_2.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_2);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate_2);
 
     println!("Contract Call 3:");
-    println!("  - EVM-based: {} gas", evm_call_estimate_3.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_3);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate_3);
 
     println!("Contract Call 4:");
-    println!("  - EVM-based: {} gas", evm_call_estimate_4.estimated_gas);
+    println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_4);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate_4);
 
     println!("\nAll gas estimation approaches tested successfully!");

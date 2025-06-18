@@ -1,9 +1,11 @@
 mod error;
 mod gas_estimator;
 mod rpc_server;
-mod tests;
 mod tracer;
 mod utils;
+
+#[cfg(test)]
+mod tests;
 
 use gas_estimator::GasEstimator;
 use rpc_server::RpcServer;
