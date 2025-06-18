@@ -1,11 +1,13 @@
 use crate::{
+    error::Error,
     tracer::Tracer,
     utils::{calculate_calldata_cost, calculate_contract_creation_cost},
 };
 use alloy::{
     eips::BlockId,
+    network::Ethereum,
     primitives::U64,
-    providers::{Provider, ProviderBuilder},
+    providers::{Provider, RootProvider},
 };
 use revm::{
     context::{transaction::AccessList, tx::TxEnvBuilder},
@@ -74,23 +76,17 @@ pub struct NetworkGasInfo {
 }
 
 pub struct GasEstimator {
-    rpc_url: String,
+    provider: RootProvider,
 }
 
 impl GasEstimator {
-    pub async fn new(rpc_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            rpc_url: rpc_url.to_string(),
-        })
+    pub fn new(rpc_url: &str) -> Self {
+        let provider = RootProvider::<Ethereum>::new_http(rpc_url.parse().unwrap());
+        Self { provider }
     }
 
     /// Custom gas estimation implementation from scratch
-    pub async fn estimate_gas(
-        &self,
-        tx_params: Tx,
-    ) -> Result<GasEstimate, Box<dyn std::error::Error>> {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-
+    pub async fn estimate_gas(&self, tx_params: Tx) -> Result<GasEstimate, Error> {
         // Calculate gas breakdown using our custom logic
         let breakdown = self.calculate_gas_breakdown(&tx_params).await?;
 
@@ -99,7 +95,11 @@ impl GasEstimator {
             breakdown.base_cost + breakdown.contract_creation_cost + breakdown.execution_cost;
 
         // Get current gas price information
-        let gas_price = provider.get_gas_price().await?;
+        let gas_price = self
+            .provider
+            .get_gas_price()
+            .await
+            .map_err(Error::RpcError)?;
 
         // Calculate total cost
         let total_cost_wei = estimated_gas * tx_params.gas_price.unwrap_or(gas_price);
@@ -113,11 +113,8 @@ impl GasEstimator {
     }
 
     /// Calculate detailed gas breakdown using specialized estimators
-    async fn calculate_gas_breakdown(
-        &self,
-        tx_params: &Tx,
-    ) -> Result<GasBreakdown, Box<dyn std::error::Error>> {
-        // Base transaction cost (21,000 gas for simple transfers)
+    async fn calculate_gas_breakdown(&self, tx_params: &Tx) -> Result<GasBreakdown, Error> {
+        // Base transaction cost
         let base_cost = 21_000;
 
         let execution_cost = if tx_params.to.is_some() && tx_params.data.is_some() {
@@ -149,12 +146,15 @@ impl GasEstimator {
         })
     }
 
-    async fn is_contract(&self, to: Option<Address>) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn is_contract(&self, to: Option<Address>) -> Result<bool, Error> {
         if to.is_none() {
             return Ok(false);
         }
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let code = provider.get_code_at(to.unwrap()).await?;
+        let code = self
+            .provider
+            .get_code_at(to.unwrap())
+            .await
+            .map_err(Error::RpcError)?;
         Ok(!code.is_empty())
     }
 
@@ -167,20 +167,23 @@ impl GasEstimator {
         addr_u64 >= 1 && addr_u64 <= 9
     }
 
-    pub async fn simulate_call(&self, tx_params: &Tx) -> Result<u128, Box<dyn std::error::Error>> {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let current_gas_price = provider.get_gas_price().await?;
+    pub async fn simulate_call(&self, tx_params: &Tx) -> Result<u128, Error> {
+        let current_gas_price = self
+            .provider
+            .get_gas_price()
+            .await
+            .map_err(Error::RpcError)?;
         let mut tracer = Tracer::new();
 
         let mut cache_db = CacheDB::new(EmptyDB::default());
 
         // Get actual balance from the provider
         let caller = tx_params.from.unwrap();
-        self.add_balance_to_db(&mut cache_db, caller).await;
+        self.add_balance_to_db(&mut cache_db, caller).await?;
 
         // Get contract code from provider and add it to cache
         let contract_address = tx_params.to.unwrap();
-        self.add_code_to_db(&mut cache_db, contract_address).await;
+        self.add_code_to_db(&mut cache_db, contract_address).await?;
 
         let account = cache_db.load_account(caller).unwrap();
         let tx_evm = TxEnvBuilder::new()
@@ -230,24 +233,32 @@ impl GasEstimator {
             tracer.has_new_accesses()
         } {
             for contract_address in &tracer.contract_addresses {
-                self.add_code_to_db(&mut cache_db, *contract_address).await;
+                self.add_code_to_db(&mut cache_db, *contract_address)
+                    .await?;
             }
             for (contract_address, storage_slot) in &tracer.storage_accesses {
                 self.populate_storage_slot(&mut cache_db, *contract_address, *storage_slot)
-                    .await;
+                    .await?;
             }
             tracer.reset_state();
         }
         Ok(latest_gas_costs)
     }
 
-    pub async fn add_balance_to_db(&self, cache_db: &mut CacheDB<EmptyDB>, caller: Address) {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let balance = provider.get_balance(caller).await.unwrap_or_else(|_| {
+    pub async fn add_balance_to_db(
+        &self,
+        cache_db: &mut CacheDB<EmptyDB>,
+        caller: Address,
+    ) -> Result<(), Error> {
+        let balance = self.provider.get_balance(caller).await.unwrap_or_else(|_| {
             // Fallback to a reasonable amount if balance fetch fails
             U256::from(10u128.pow(18) * 1000) // 1000 ETH
         });
-        let nonce = provider.get_transaction_count(caller).await.unwrap_or(0);
+        let nonce = self
+            .provider
+            .get_transaction_count(caller)
+            .await
+            .unwrap_or(0);
 
         cache_db.insert_account_info(
             caller,
@@ -258,10 +269,16 @@ impl GasEstimator {
                 code: None,
             },
         );
+
+        Ok(())
     }
-    pub async fn add_code_to_db(&self, cache_db: &mut CacheDB<EmptyDB>, contract_address: Address) {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let contract_code = provider
+    pub async fn add_code_to_db(
+        &self,
+        cache_db: &mut CacheDB<EmptyDB>,
+        contract_address: Address,
+    ) -> Result<(), Error> {
+        let contract_code = self
+            .provider
             .get_code_at(contract_address)
             .await
             .unwrap_or_default();
@@ -277,6 +294,8 @@ impl GasEstimator {
                 },
             );
         }
+
+        Ok(())
     }
 
     pub async fn populate_storage_slot(
@@ -284,21 +303,32 @@ impl GasEstimator {
         cache_db: &mut CacheDB<EmptyDB>,
         contract_address: Address,
         storage_slot: U256,
-    ) {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let storage_val = provider
+    ) -> Result<(), Error> {
+        let storage_val = self
+            .provider
             .get_storage_at(contract_address, storage_slot)
             .await
-            .unwrap();
+            .map_err(Error::RpcError)?;
+
         cache_db
             .insert_account_storage(contract_address, storage_slot, storage_val)
             .unwrap();
+
+        Ok(())
     }
 
-    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Box<dyn std::error::Error>> {
-        let provider = ProviderBuilder::new().connect(&self.rpc_url).await.unwrap();
-        let gas_price = provider.get_gas_price().await?;
-        let latest_block = provider.get_block(BlockId::latest()).await?.unwrap();
+    pub async fn get_network_gas_info(&self) -> Result<NetworkGasInfo, Error> {
+        let gas_price = self
+            .provider
+            .get_gas_price()
+            .await
+            .map_err(Error::RpcError)?;
+        let latest_block = self
+            .provider
+            .get_block(BlockId::latest())
+            .await
+            .map_err(Error::RpcError)?
+            .unwrap();
 
         let base_fee_per_gas = latest_block.header.base_fee_per_gas;
         let gas_used = latest_block.header.gas_used;

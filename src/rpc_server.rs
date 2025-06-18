@@ -44,16 +44,7 @@ impl GasEstimationRpcServer for GasEstimationRpcImpl {
         let rpc_url = request.rpc_url.as_ref().unwrap_or(&self.default_rpc_url);
 
         // Create gas estimator instance
-        let estimator = match GasEstimator::new(rpc_url).await {
-            Ok(estimator) => estimator,
-            Err(e) => {
-                return Err(ErrorObjectOwned::owned(
-                    -32603,
-                    format!("Failed to create gas estimator: {}", e),
-                    None::<String>,
-                ))
-            }
-        };
+        let estimator = GasEstimator::new(rpc_url);
 
         // Perform gas estimation
         let estimate = match estimator.estimate_gas(request.transaction).await {

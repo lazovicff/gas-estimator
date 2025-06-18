@@ -23,28 +23,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test connection to the RPC endpoint
     println!("Testing connection to Ethereum network...");
-    match GasEstimator::new(&default_rpc_url).await {
-        Ok(estimator) => match estimator.get_network_gas_info().await {
-            Ok(network_info) => {
-                println!("    Connected to Ethereum network!");
-                println!(
-                    "    Current Gas Price: {} Gwei",
-                    network_info.current_gas_price
-                );
-                println!("    Latest Block: {}", network_info.latest_block_number);
-                if let Some(base_fee) = network_info.base_fee_per_gas {
-                    println!("    Base Fee: {} Gwei", base_fee);
-                }
+    let estimator = GasEstimator::new(&default_rpc_url);
+    match estimator.get_network_gas_info().await {
+        Ok(network_info) => {
+            println!("    Connected to Ethereum network!");
+            println!(
+                "    Current Gas Price: {} Gwei",
+                network_info.current_gas_price
+            );
+            println!("    Latest Block: {}", network_info.latest_block_number);
+            if let Some(base_fee) = network_info.base_fee_per_gas {
+                println!("    Base Fee: {} Gwei", base_fee);
             }
-            Err(e) => {
-                println!("    Warning: Could not fetch network info: {}", e);
-                println!("    Server will still start, but gas estimation may be limited");
-            }
-        },
+        }
         Err(e) => {
-            eprintln!("    ❌ Failed to connect to Ethereum RPC: {}", e);
-            eprintln!("    Please check your RPC URL and try again");
-            return Err(e);
+            println!("    Warning: Could not fetch network info: {}", e);
+            println!("    Server will still start, but gas estimation may be limited");
         }
     }
 
