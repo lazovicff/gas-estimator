@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 pub struct Tracer {
     pub contract_addresses: HashSet<Address>,
     pub storage_accesses: HashMap<Address, U256>,
-    current_address: Option<Address>,
+    address_stack: Vec<Address>,
     // Keep track of historical accesses
     storage_access_archive: HashMap<Address, U256>,
     contract_addresses_archive: HashSet<Address>,
@@ -25,7 +25,7 @@ impl Tracer {
         Self {
             contract_addresses: HashSet::new(),
             storage_accesses: HashMap::new(),
-            current_address: None,
+            address_stack: Vec::new(),
 
             storage_access_archive: HashMap::new(),
             contract_addresses_archive: HashSet::new(),
@@ -57,6 +57,9 @@ impl<CTX> Inspector<CTX> for Tracer
 where
     CTX: ContextTr<Journal: JournalExt>,
 {
+    // IMPROVEMENT:
+    // Since CTX is available on every call
+    // We can dinamically fetch account code and balance to populate DB
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         if !self
             .contract_addresses_archive
@@ -64,23 +67,26 @@ where
         {
             self.contract_addresses.insert(inputs.target_address);
         }
-        self.current_address = Some(inputs.target_address);
+        self.address_stack.push(inputs.target_address);
         None
     }
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, _outcome: &mut CallOutcome) {
-        self.current_address = None;
+        self.address_stack.pop();
     }
 
+    // IMPROVEMENT:
+    // Since CTX is available on every call
+    // We can dinamically fetch storage variables and populate the DB
     fn step(&mut self, interpreter: &mut Interpreter, _context: &mut CTX) {
         // Get the current opcode from the bytecode
         match interpreter.bytecode.opcode() {
             // SLOAD - Load from storage (opcode 0x54)
             opcode::SLOAD => {
                 if let Ok(slot) = interpreter.stack.peek(0) {
-                    if let Some(address) = self.current_address {
-                        if !self.storage_access_archive.contains_key(&address) {
-                            self.storage_accesses.insert(address, slot);
+                    if let Some(address) = self.address_stack.last() {
+                        if !self.storage_access_archive.contains_key(address) {
+                            self.storage_accesses.insert(*address, slot);
                         }
                     }
                 }

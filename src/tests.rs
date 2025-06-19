@@ -1,7 +1,9 @@
 use crate::{gas_estimator::Tx, rpc_server::RpcServer};
 use alloy::{
+    eips::BlockId,
     primitives::{address, U256, U64},
     providers::{Provider, ProviderBuilder},
+    rpc::types::Block,
     signers::local::{coins_bip39::English, MnemonicBuilder},
     sol,
     sol_types::SolCall,
@@ -98,6 +100,13 @@ async fn test_all_gas_estimation_approaches() {
         .connect(ETH_RPC_URL)
         .await
         .unwrap();
+    let block: Block = provider
+        .get_block(BlockId::latest())
+        .await
+        .unwrap()
+        .unwrap();
+    // block.header.base_fee_per_gas
+    // let block_body = block.into_block_body_unchecked();
 
     // Deploy contract once for testing contract calls
     let contract = Counter::deploy(&provider).await.unwrap();

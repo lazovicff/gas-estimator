@@ -115,6 +115,8 @@ impl GasEstimator {
     /// Calculate detailed gas breakdown using specialized estimators
     async fn calculate_gas_breakdown(&self, tx_params: &Tx) -> Result<GasBreakdown, Error> {
         // Base transaction cost
+        // IMPROVEMENT
+        // Use provider to fetch base fee per gas to determain base fee
         let base_cost = if let Some(chain_id) = tx_params.chain_id {
             // Anvil has 0 base cost if calling a contract
             if chain_id == U64::from(31337) && self.is_contract(tx_params.to).await? {
@@ -141,6 +143,8 @@ impl GasEstimator {
         };
 
         // Calculate contract creation cost
+        // IMPROVEMENT:
+        // Use EVM for more precise predictions
         let contract_creation_cost = if tx_params.to.is_none() {
             calculate_contract_creation_cost(tx_params.data.as_ref())
         } else {
@@ -195,6 +199,10 @@ impl GasEstimator {
         self.add_code_to_db(&mut cache_db, contract_address).await?;
 
         let account = cache_db.load_account(caller).unwrap();
+        // IMPROVEMENT
+        // Add:
+        // - gas_priority_fee
+        // - max_fee_per_gas
         let tx_evm = TxEnvBuilder::new()
             .caller(caller)
             .kind(TxKind::Call(tx_params.to.unwrap()))
