@@ -106,6 +106,9 @@ async fn test_all_gas_estimation_approaches() {
     let contract = Caller::deploy(&provider).await.unwrap();
     let caller_contract_address = *contract.address();
 
+    let contract = ERC20::deploy(&provider).await.unwrap();
+    let erc20_contract_address = *contract.address();
+
     // Test Case 1: Simple Transfer
     let simple_transfer_tx = Tx {
         from: Some(wallet.address()),
@@ -181,8 +184,8 @@ async fn test_all_gas_estimation_approaches() {
         chain_id: Some(U64::from(31337)),
         gas_limit: None,
         gas_price: Some(20000000000),
-        max_fee_per_gas: Some(30000000000),
-        max_priority_fee_per_gas: Some(2000000000),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
         access_list: None,
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
@@ -214,8 +217,8 @@ async fn test_all_gas_estimation_approaches() {
         chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
-        max_fee_per_gas: Some(30000000000),
-        max_priority_fee_per_gas: Some(2000000000),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
         access_list: None,
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
@@ -247,8 +250,8 @@ async fn test_all_gas_estimation_approaches() {
         chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
-        max_fee_per_gas: Some(30000000000),
-        max_priority_fee_per_gas: Some(2000000000),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
         access_list: None,
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
@@ -280,8 +283,8 @@ async fn test_all_gas_estimation_approaches() {
         chain_id: Some(U64::from(31337)), // Anvil default chain ID
         gas_limit: None,
         gas_price: Some(20000000000),
-        max_fee_per_gas: Some(30000000000),
-        max_priority_fee_per_gas: Some(2000000000),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
         access_list: None,
         transaction_type: Some(U64::from(2)), // EIP-1559
     };
@@ -299,6 +302,42 @@ async fn test_all_gas_estimation_approaches() {
 
     let alloy_call_result = provider.estimate_gas(alloy_call_tx).await;
     let alloy_call_estimate_4 = alloy_call_result.unwrap();
+
+    // Call 5 ------------------------------------------------------
+    let call_data = ERC20::transferCall::new((
+        address!("0x1234567890123456789012345678901234567890"),
+        U256::from(1),
+    ));
+    let encoded_call_data = Bytes::from(call_data.abi_encode());
+
+    let contract_call_tx = Tx {
+        from: Some(wallet.address()),
+        to: Some(erc20_contract_address),
+        value: U256::ZERO,
+        data: Some(encoded_call_data.clone()),
+        nonce: Some(1),
+        chain_id: Some(U64::from(31337)), // Anvil default chain ID
+        gas_limit: None,
+        gas_price: Some(20000000000),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        access_list: None,
+        transaction_type: Some(U64::from(2)), // EIP-1559
+    };
+
+    // Test EVM-based estimation for contract call via RPC
+    let evm_call_estimate_5 = estimate_gas_via_rpc(&server_url, contract_call_tx.clone())
+        .await
+        .unwrap();
+
+    // Test Alloy provider estimation for contract call
+    let alloy_call_tx = alloy::rpc::types::TransactionRequest::default()
+        .from(wallet.address())
+        .to(erc20_contract_address)
+        .input(encoded_call_data.into());
+
+    let alloy_call_result = provider.estimate_gas(alloy_call_tx).await;
+    let alloy_call_estimate_5 = alloy_call_result.unwrap();
 
     // Summary and comparison
     println!("\nSummary Comparison:");
@@ -325,6 +364,10 @@ async fn test_all_gas_estimation_approaches() {
     println!("Contract Call 4:");
     println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_4);
     println!("  - Alloy Provider: {} gas", alloy_call_estimate_4);
+
+    println!("Contract Call 5:");
+    println!("  - EVM-based (via RPC): {} gas", evm_call_estimate_5);
+    println!("  - Alloy Provider: {} gas", alloy_call_estimate_5);
 
     println!("\nAll gas estimation approaches tested successfully!");
 }
